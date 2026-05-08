@@ -323,6 +323,31 @@ Checkpoints are written to `checkpoints/`:
 
 To resume training from the last checkpoint, just run `python train.py` again — it picks up `checkpoints/latest.pt` automatically.
 
+### Training log CSV
+
+Every 100 steps, a row is appended to `checkpoints/training_log.csv`:
+
+| Column | Description |
+|---|---|
+| `step` | Optimizer step number |
+| `train_loss` | Average L1 loss over the last 50 steps |
+| `val_loss` | Most recent validation loss (carries forward between checkpoints) |
+| `learning_rate` | Current LR after warmup / cosine schedule |
+
+The file is created with a header on first run and **appended** on resume — rows are never overwritten. Change the filename with `--csv-log`:
+
+```bash
+python train.py --csv-log run2.csv   # writes to checkpoints/run2.csv
+```
+
+Quick inspection:
+
+```python
+import pandas as pd
+df = pd.read_csv("checkpoints/training_log.csv")
+df.plot(x="step", y=["train_loss", "val_loss"])
+```
+
 ### Qualitative audio samples
 
 Every `SAVE_EVERY` steps, validation saves three WAV files to `checkpoints/samples/step_{N}/`:
@@ -344,6 +369,7 @@ Every `SAVE_EVERY` steps, validation saves three WAV files to `checkpoints/sampl
 | `--output-dir` | `checkpoints` | Checkpoint and sample output directory |
 | `--num-workers` | `8` | DataLoader worker processes |
 | `--reset` | off | Train from scratch, ignoring existing checkpoint |
+| `--csv-log` | `training_log.csv` | CSV filename inside `--output-dir` for loss logging |
 
 Key constants at the top of `train.py`:
 

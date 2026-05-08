@@ -18,6 +18,7 @@ Usage:
 """
 
 import argparse
+import csv
 import sys
 from pathlib import Path
 
@@ -38,10 +39,11 @@ from dataset import SpeakerDataset, collate_fn
 SAMPLE_RATE = 16_000
 VOCODER_SR = 24_000  # mel computation and vocoder output sample rate
 BATCH_SIZE = 40  # physical batch per GPU step — increase to fill VRAM
-GRAD_ACCUM = 1  # effective batch = BATCH_SIZE * GRAD_ACCUM = 32
+GRAD_ACCUM = 2  # effective batch = BATCH_SIZE * GRAD_ACCUM = 32
 MAX_STEPS = 100_000
-SAVE_EVERY = 1_000
-LOG_EVERY = 50
+SAVE_EVERY = 1000
+LOG_EVERY = 1
+CSV_LOG_EVERY = 1
 WARMUP_STEPS = 1_000
 LR = 1e-4
 WEIGHT_DECAY = 1e-2
@@ -86,6 +88,12 @@ def train(args) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     step = 0
     best_loss = float("inf")
+    last_val_loss = float("inf")
+
+    csv_path = output_dir / args.csv_log
+    if not csv_path.exists():
+        with open(csv_path, "w", newline="") as f:
+            csv.writer(f).writerow(["step", "train_loss", "val_loss", "learning_rate"])
 
     ckpt_path = output_dir / "latest.pt"
     if ckpt_path.exists() and not args.reset:
@@ -100,6 +108,7 @@ def train(args) -> None:
     # ── Dataset & DataLoader ──────────────────────────────────────────────────
     train_ds = SpeakerDataset(args.data_root, split="train", max_sec=MAX_AUDIO_SEC)
     val_ds = SpeakerDataset(args.data_root, split="val", max_sec=MAX_AUDIO_SEC)
+    val_subset = torch.utils.data.Subset(val_ds, range(50))
 
     train_loader = DataLoader(
         train_ds,
@@ -113,7 +122,7 @@ def train(args) -> None:
         persistent_workers=(args.num_workers > 0),
     )
     val_loader = DataLoader(
-        val_ds,
+        val_subset,
         batch_size=BATCH_SIZE,
         shuffle=False,
         num_workers=0,
@@ -203,6 +212,10 @@ def train(args) -> None:
                     running_loss = 0.0
                     logger.info(f"step={step:6d}  loss={avg:.4f}  lr={lr:.2e}")
 
+                    if step % CSV_LOG_EVERY == 0:
+                        with open(csv_path, "a", newline="") as f:
+                            csv.writer(f).writerow([step, avg, last_val_loss, lr])
+
                 # ── Checkpointing ─────────────────────────────────────────────
                 if step % SAVE_EVERY == 0:
                     avg_loss = _validate(
@@ -214,6 +227,7 @@ def train(args) -> None:
                         step=step,
                         output_dir=output_dir,
                     )
+                    last_val_loss = avg_loss
                     logger.info(f"Validation loss @ step {step}: {avg_loss:.4f}")
 
                     ckpt = {
@@ -324,6 +338,11 @@ def main() -> None:
         "--reset",
         action="store_true",
         help="Ignore existing checkpoint and train from scratch",
+    )
+    parser.add_argument(
+        "--csv-log",
+        default="training_log.csv",
+        help="CSV filename inside --output-dir for logging (default: training_log.csv)",
     )
     args = parser.parse_args()
     train(args)

@@ -195,7 +195,8 @@ def train(args) -> None:
 
                 # ── Checkpointing ─────────────────────────────────────────────
                 if step % SAVE_EVERY == 0:
-                    avg_loss = _validate(model, val_loader, device, mel_transform)
+                    avg_loss = _validate(model, val_loader, device, mel_transform,
+                                         step=step, output_dir=output_dir)
                     logger.info(f"Validation loss @ step {step}: {avg_loss:.4f}")
 
                     ckpt = {
@@ -223,10 +224,13 @@ def _validate(
     loader: DataLoader,
     device: torch.device,
     mel_transform,
+    step: int = 0,
+    output_dir: Path = None,
 ) -> float:
     model.eval()
     total_loss = 0.0
     n = 0
+    samples_saved = False
 
     for batch in loader:
         source = batch["source_audio"].to(device)
@@ -249,6 +253,30 @@ def _validate(
 
         total_loss += loss.item()
         n += 1
+
+        # ── Audio samples: first batch only ──────────────────────────────────
+        if not samples_saved and output_dir is not None:
+            samples_saved = True
+            sample_dir = output_dir / "samples" / f"step_{step}"
+            sample_dir.mkdir(parents=True, exist_ok=True)
+
+            # Raw waveforms (take first item; source/target are [B, T])
+            torchaudio.save(str(sample_dir / "source.wav"),
+                            source[0:1].cpu(), SAMPLE_RATE)
+            torchaudio.save(str(sample_dir / "target.wav"),
+                            target[0:1].cpu(), SAMPLE_RATE)
+
+            # Converted: source content + target speaker C → vocoder
+            # Uses source (not target) to test cross-speaker generalisation,
+            # mirroring real inference rather than the self-reconstruction loss.
+            with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
+                src_content = model.content_encoder(source[0:1])
+                src_fused = model.cross_attention(src_content, C[0:1])
+                src_mel = model.decoder(src_fused)
+                wav = model.vocoder(src_mel.transpose(1, 2))   # [1, 1, T_wav]
+            torchaudio.save(str(sample_dir / "converted.wav"),
+                            wav[0].cpu(), SAMPLE_RATE)
+
         if n >= 50:   # cap validation batches for speed
             break
 

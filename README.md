@@ -1,72 +1,80 @@
 # Real-Time Deterministic Voice Conversion Pipeline
 
-A few-shot, real-time voice conversion system. Record a few seconds of a target speaker's voice, and the system converts your live microphone input into that speaker's voice with low latency.
+Few-shot, real-time voice conversion. Record a few seconds of a target speaker — the system converts your live microphone input into that voice with low latency.
 
-**Architecture:** Deterministic attention-based conditioning — no VAEs, no probabilistic sampling, fully stable for live streaming.
+**Architecture:** Deterministic attention-based conditioning — no VAEs, no probabilistic sampling, fully stable for streaming.
+
+---
+
+## Table of Contents
+
+- [Quick Start](#quick-start)
+- [Project Structure](#project-structure)
+- [Architecture](#architecture)
+- [Training Strategy](#training-strategy)
+- [Setup](#setup)
+- [Dataset — `dataset.py`](#dataset--datasetpy)
+- [Training — `train.py`](#training--trainpy)
+- [Real-Time Inference — `mic_convert.py`](#real-time-inference--mic_convertpy)
+- [Offline Inference — `convert.py`](#offline-inference--convertpy)
+- [Networked Mode](#networked-mode-optional)
+- [Implementation Notes](#implementation-notes)
+- [Verification](#verification)
 
 ---
 
 ## Quick Start
 
 ```bash
-# 1. Create environment
-conda env create -f environment.yml
-conda activate voice
+conda env create -f environment.yml && conda activate voice
 
-# 2. Download VCTK into datasets/
+# Download VCTK (~11 GB)
 wget https://datashare.ed.ac.uk/bitstream/handle/10283/3443/VCTK-Corpus-0.92.zip
 unzip VCTK-Corpus-0.92.zip -d datasets/
 
-# 3. Train (default --data-root points to datasets/VCTK-Corpus-0.92/wav48_silence_trimmed)
-python train.py
-
-# 4a. Real-time mic conversion (record reference from mic)
-python mic_convert.py --checkpoint checkpoints/best.pt
-
-# 4b. Real-time mic conversion (use a WAV as reference)
-python mic_convert.py --checkpoint checkpoints/best.pt --reference alice.wav
-
-# 4c. Offline file conversion
-python convert.py --source my_voice.wav --reference alice.wav --output out.wav
+python train.py                                                    # train
+python mic_convert.py --checkpoint checkpoints/best.pt            # real-time
+python convert.py --source me.wav --reference alice.wav --output out.wav  # offline
 ```
 
 ---
 
 ## Project Structure
 
+<details>
+<summary>File map</summary>
+
 ```
 voice/
 ├── environment.yml             # Conda environment (Python 3.10, PyTorch + CUDA 12.4)
+├── datasets/                   # All datasets go here
+├── dataset.py                  # Generic speaker-folder dataset for training
+├── train.py                    # Training loop (AMP + gradient accumulation)
+├── convert.py                  # Offline file-to-file voice conversion
+├── mic_convert.py              # Real-time microphone conversion (no server needed)
 │
-├── datasets/                   # ★ All datasets go here
-│   └── VCTK-Corpus-0.92/
-│       └── wav48_silence_trimmed/
-│           ├── p225/
-│           └── ...
-│
-├── dataset.py                  # ★ Generic speaker-folder dataset for training
-├── train.py                    # ★ Training loop (AMP + gradient accumulation)
-├── convert.py                  # ★ Offline file-to-file voice conversion
-├── mic_convert.py              # ★ Real-time microphone conversion (no server needed)
-│
-├── checkpoints/                # Saved model checkpoints (created by train.py)
+├── checkpoints/                # Created by train.py
 │   ├── best.pt
-│   └── latest.pt
+│   ├── latest.pt
+│   └── samples/step_N/         # Qualitative audio saved every SAVE_EVERY steps
+│       ├── source.wav
+│       ├── target.wav
+│       └── converted.wav
 │
 ├── core/
 │   ├── modules/
-│   │   ├── context_encoder.py  # Deterministic mean-pooling transformer → C [256]
+│   │   ├── context_encoder.py  # Transformer mean-pool → C [256]
 │   │   ├── content_encoder.py  # DeepFilterNet3 + HuBERT + torchcrepe F0
-│   │   ├── cross_attention.py  # Cross-attention: Q=content, K/V=C
+│   │   ├── cross_attention.py  # Q=content, K/V=C
 │   │   └── decoder.py          # Conv1d + Transformer + 2× upsample → Mel [80]
-│   ├── model.py                # Full pipeline wrapper (train + inference)
+│   ├── model.py                # Full pipeline wrapper
 │   └── vocoder.py              # HiFi-GAN wrapper (frozen)
 │
-├── server/
-│   └── app.py                  # Optional: FastAPI + WebSocket server
-└── client/
-    └── stream_client.py        # Optional: PyAudio client for networked server
+├── server/app.py               # Optional FastAPI + WebSocket server
+└── client/stream_client.py     # Optional PyAudio client for networked server
 ```
+
+</details>
 
 ---
 
@@ -80,7 +88,7 @@ TARGET SPEAKER (reference audio)
 │   Context Encoder   │  Transformer (4 layers) + Mean Pool
 │     (Trainable)     │  [B, 80, T_ctx] → C [B, 256]
 └─────────────────────┘
-        │  C (computed once, cached)
+        │  C (computed once, cached per speaker)
         ▼
 SOURCE SPEAKER (live mic / audio file)
         │
@@ -104,7 +112,7 @@ SOURCE SPEAKER (live mic / audio file)
         │
         ▼
 ┌─────────────────────┐
-│   HiFi-GAN Vocoder  │  torchaudio HIFIGAN_16K_100HZ
+│   HiFi-GAN Vocoder  │  torchaudio HIFIGAN_16K_100HZ (frozen)
 │      (Frozen)       │  [B, 80, T_mel] → [B, 1, T_wav]
 └─────────────────────┘
         │
@@ -114,12 +122,12 @@ SOURCE SPEAKER (live mic / audio file)
 
 | Module | Trainable | Parameters |
 |---|---|---|
-| ContextEncoder | Yes | ~3.1M |
-| CrossAttentionFusion | Yes | ~460K |
-| MelDecoder | Yes | ~2.2M |
-| ContentEncoder (DFN3 + HuBERT + crepe) | No | ~122M |
-| HiFiGANVocoder | No | ~13.9M |
-| **Total trainable** | | **~5.8M (~22 MB fp32)** |
+| ContextEncoder | Yes | ~3.1 M |
+| CrossAttentionFusion | Yes | ~460 K |
+| MelDecoder | Yes | ~2.2 M |
+| ContentEncoder (DFN3 + HuBERT + crepe) | No | ~122 M |
+| HiFiGANVocoder | No | ~13.9 M |
+| **Total trainable** | | **~5.8 M (~22 MB fp32)** |
 
 ---
 
@@ -127,22 +135,20 @@ SOURCE SPEAKER (live mic / audio file)
 
 ### The non-parallel data problem
 
-Voice conversion requires training a model that separates *what* is said (phonetic content) from *who* says it (speaker identity), then recombines them. The obvious approach — feeding source audio in, comparing against a recording of a different speaker saying the exact same sentence — requires **parallel data**: transcribed sentence-aligned recordings across every speaker pair. Parallel corpora are rare and expensive to collect.
+Voice conversion requires separating *what is said* (phonetic content) from *who says it* (speaker identity), then recombining them. The direct approach — comparing converted audio against a ground-truth recording of a different speaker saying the same sentence — requires **parallel data**: sentence-aligned recordings across every speaker pair. Parallel corpora are rare and expensive to collect.
 
-VCTK and LibriSpeech are **non-parallel**: each speaker says different sentences. You cannot compute a meaningful L1 loss between "Speaker A saying *apple*" and "Speaker B saying *banana*" — their mel spectrograms have nothing to compare frame-by-frame.
+VCTK and LibriSpeech are **non-parallel**: each speaker says different sentences. Computing a frame-wise L1 loss between "Speaker A saying *apple*" and "Speaker B saying *banana*" is meaningless — the mel spectrograms have nothing to compare.
 
 ### Self-reconstruction
 
-The training loop uses a **self-reconstruction** objective to sidestep this entirely.
-
-During training the content encoder receives the **target audio**, not the source:
+The training loop uses a **self-reconstruction** objective to sidestep this entirely. The content encoder receives the **target audio** (not the source), and the loss is computed against the same target utterance:
 
 ```
 Training forward pass
-─────────────────────────────────────────────────────────────
+─────────────────────────────────────────────────────────────────────
 target_audio  ──→  [ContentEncoder (frozen)]  ──→  content features
-                         (HuBERT strips speaker identity,
-                          preserves phonetics)
+                        (HuBERT discards speaker acoustics,
+                         preserves phonetics)
 
 context_mels  ──→  [ContextEncoder]  ──→  C  (target speaker embedding)
 
@@ -151,13 +157,13 @@ content + C   ──→  [CrossAttention + Decoder]  ──→  pred_mel
 Loss:  L1( pred_mel,  mel(target_audio) )   ← both sides are the target
 ```
 
-Because both the prediction and the ground truth are derived from the same utterance, the loss is phonetically valid. The model must learn to inject speaker identity from `C` into the content features in order to reconstruct `target_mel`.
+Because both prediction and ground truth derive from the same utterance, the loss is phonetically valid. The model must learn to inject speaker identity from `C` to reconstruct `target_mel` — it cannot shortcut by aligning with a different sentence.
 
-At **inference time** the roles switch back to the intended conversion task:
+At **inference time** the roles switch to the intended conversion task:
 
 ```
 Inference forward pass
-─────────────────────────────────────────────────────────────
+─────────────────────────────────────────────────────────────────────
 source_audio  ──→  [ContentEncoder]  ──→  content features (source phonetics)
 reference     ──→  [ContextEncoder]  ──→  C  (target speaker embedding)
 
@@ -166,42 +172,35 @@ content + C   ──→  [CrossAttention + Decoder]  ──→  converted mel
 
 ### Why HuBERT makes this work
 
-HuBERT is pre-trained with a masked prediction objective on large-scale speech, causing its internal representations to correlate with phonemes more than with speaker acoustics. Feeding `target_audio` through HuBERT therefore produces a representation that carries the *content* of the utterance but has had much of the speaker-specific spectral detail discarded. Without that bottleneck, the model could learn to copy the input rather than synthesize it, and the context vector `C` would never be needed.
+HuBERT is pre-trained with a masked-prediction objective on large-scale speech, so its internal representations correlate with phonemes more than with speaker acoustics. Feeding `target_audio` through HuBERT produces features that carry the *content* of the utterance while discarding much of the speaker-specific spectral shape. Without that bottleneck the model could learn to copy the input and ignore `C` entirely.
 
 ### Copy-synthesis risk
 
-HuBERT is not a perfect disentangler — layer-6 features still carry some speaker identity. If the cross-attention can exploit that residual signal to reconstruct the target without consulting `C`, the model learns *copy synthesis*: it appears to reconstruct well during training but fails at inference because it ignores `C` when the source speaker differs.
+HuBERT layer-6 features are not perfectly speaker-agnostic — some identity leaks through. If cross-attention exploits that residual signal, the model learns *copy synthesis*: reconstruction loss looks good but cross-speaker conversion fails at inference because `C` is never truly consulted.
 
-Signs of copy synthesis at inference:
-- Converted output sounds like the **source** speaker, not the target
-- Validation loss is low but perceptual quality of cross-speaker conversion is poor
+**Signs:** converted audio sounds like the source, not the target; validation loss is low but listening tests are poor.
 
-Mitigations (in increasing complexity):
-1. **Information bottleneck** — add a narrow FC layer or vector quantization (VQ) between the content encoder and cross-attention to hard-limit the information throughput
-2. **Speaker perturbation** — randomly pitch-shift or formant-shift `target_audio` before feeding it to the content encoder, so the model cannot rely on absolute spectral values for speaker identity
-3. **Speaker adversarial loss** — add a speaker classifier head on the content features and train it adversarially to remove speaker information from the content path
+**Mitigations (in increasing complexity):**
 
----
-
-## Hardware Requirements
-
-- **GPU:** NVIDIA RTX 5060 Ti (16 GB VRAM) or equivalent
-- **CUDA:** Driver ≥ 12.x (tested on 13.2)
-- **OS:** WSL2 Ubuntu for training and inference · Windows for mic client
-- **RAM:** ≥ 16 GB system RAM
+1. **Information bottleneck** — narrow FC layer or vector quantization (VQ) between content encoder and cross-attention
+2. **Speaker perturbation** — randomly pitch-shift or formant-shift `target_audio` before the content encoder, breaking absolute spectral cues
+3. **Speaker adversarial loss** — classifier head on content features trained adversarially to strip speaker identity from the content path
 
 ---
 
 ## Setup
 
-### 1. Create the conda environment
+**Hardware:** NVIDIA GPU with ≥8 GB VRAM (tested on RTX 5060 Ti 16 GB) · CUDA driver ≥12.x · ≥16 GB system RAM · WSL2 Ubuntu (training) or Windows (mic client)
+
+<details>
+<summary>Conda environment setup</summary>
 
 ```bash
 conda env create -f environment.yml
 conda activate voice
 ```
 
-If the solver hangs or fails with conflicts, switch to the faster libmamba solver first:
+If the solver hangs, switch to libmamba first:
 
 ```bash
 conda install -n base conda-libmamba-solver
@@ -209,128 +208,84 @@ conda config --set solver libmamba
 conda env create -f environment.yml
 ```
 
-### 2. Audio backend for microphone scripts
-
-`sounddevice` is included in `environment.yml`. If you get a PortAudio error at runtime:
+If you get a PortAudio error from `sounddevice`:
 
 ```bash
-# WSL2 / Ubuntu
-sudo apt install libportaudio2
-
-# Windows — sounddevice already includes PortAudio, no extra step needed
+sudo apt install libportaudio2   # WSL2 / Ubuntu only
 ```
 
-### Common setup errors
+</details>
 
-| Error message | Fix |
+<details>
+<summary>Common setup errors</summary>
+
+| Error | Fix |
 |---|---|
-| `CommandNotFoundError: conda activate` | Run `conda init bash`, then reopen terminal |
+| `CommandNotFoundError: conda activate` | `conda init bash`, then reopen terminal |
 | `PackagesNotFoundError: pytorch-cuda=12.4` | `conda config --add channels pytorch` and `--add channels nvidia` |
 | `prefix already exists: .../envs/voice` | `conda env remove -n voice` first |
 | `OSError: PortAudio library not found` | `sudo apt install libportaudio2` |
 | `torch.cuda.is_available()` returns `False` | `conda install pytorch=2.4.* pytorch-cuda=12.4 -c pytorch -c nvidia` |
 
+</details>
+
 ---
 
-## `dataset.py` — Training Data
+## Dataset — `dataset.py`
 
-`dataset.py` defines `SpeakerDataset`, a generic dataset class that loads audio from any folder of speaker sub-directories. **No dataset download is required** — your own recordings work fine. No parallel recordings, no matched filenames, no special naming convention required.
+`SpeakerDataset` loads audio from any folder of speaker sub-directories. No parallel recordings, no matched filenames, no special naming convention. Any sample rate is auto-resampled to 16 kHz. Minimum: **2 speakers**, **7 files each**.
 
-All datasets are stored in the `datasets/` folder at the project root.
+For each training sample it picks a random source speaker, a random target speaker, and `N_CTX=5` reference utterances from the target speaker.
 
-### Option A — VCTK (default, recommended)
+<details>
+<summary>Dataset options and download commands</summary>
 
-110 speakers, high quality, multiple accents. This is the default dataset — `train.py` points to it automatically.
+**Option A — VCTK (default, recommended)** — 110 speakers, high quality, multiple accents.
 
 ```bash
-# 1. Download (~11 GB)
 wget https://datashare.ed.ac.uk/bitstream/handle/10283/3443/VCTK-Corpus-0.92.zip
-
-# 2. Extract into datasets/
 unzip VCTK-Corpus-0.92.zip -d datasets/
-
-# datasets/ structure after extraction:
-# datasets/VCTK-Corpus-0.92/wav48_silence_trimmed/
-#   ├── p225/
-#   │   ├── p225_001_mic1.flac   ← both mic1 and mic2 used (~800 files/speaker)
-#   │   ├── p225_001_mic2.flac
-#   │   └── ...
-#   ├── p226/
-#   └── ...                      (110 speakers total)
-
-# 3. Train — no --data-root needed, default points here
-python train.py
+python train.py   # no --data-root flag needed
 ```
 
-Files are automatically resampled from 48 kHz → 16 kHz.
+> To use mic1 files only, add `and "mic2" not in f.stem` to the file-discovery loop in `dataset.py` (~line 40).
 
-> **Optional — mic1 only:** To skip mic2 duplicates, add `and "mic2" not in f.stem` to the file-discovery loop in `dataset.py` (line ~40). Training works fine either way.
-
-### Option B — LibriSpeech
-
-251 speakers, already in the right folder layout.
+**Option B — LibriSpeech** — 251 speakers, already in the right layout.
 
 ```bash
 wget https://www.openslr.org/resources/12/train-clean-100.tar.gz
 tar -xzf train-clean-100.tar.gz -C datasets/
-
-# datasets/LibriSpeech/train-clean-100/
-#   ├── 19/       ← speaker ID
-#   │   ├── 198/  ← chapter sub-folder (SpeakerDataset recurses into sub-folders)
-#   │   │   ├── 19-198-0000.flac
-#   │   │   └── ...
-
 python train.py --data-root datasets/LibriSpeech/train-clean-100
 ```
 
-### Option C — Your own recordings
-
-Record yourself and others, place them in speaker sub-folders inside `datasets/`:
+**Option C — Custom recordings**
 
 ```
-datasets/
-└── my_data/
-    ├── alice/              ← folder name = speaker identity
-    │   ├── clip_01.wav
-    │   └── ...             ← minimum 7 audio files per speaker
-    ├── bob/
-    │   └── ...
-    └── ...                 ← minimum 2 speakers total
+datasets/my_data/
+├── alice/   ← folder name = speaker identity (≥7 .wav/.flac/.mp3/.ogg files)
+├── bob/
+└── ...      (≥2 speakers)
 ```
-
-**Supported formats:** `.wav` `.flac` `.mp3` `.ogg`  
-**Sample rate:** any — automatically resampled to 16 kHz  
-**Content:** clips do not need to say the same thing
 
 ```bash
 python train.py --data-root datasets/my_data
 ```
 
-### Supported public datasets at a glance
-
 | Dataset | Speakers | Size | `--data-root` |
 |---|---|---|---|
-| [VCTK](https://datashare.ed.ac.uk/handle/10283/3443) *(default)* | 110 | ~11 GB | `datasets/VCTK-Corpus-0.92/wav48_silence_trimmed` |
-| [LibriSpeech](https://www.openslr.org/12) `train-clean-100` | 251 | ~6.3 GB | `datasets/LibriSpeech/train-clean-100` |
-| [LJSpeech](https://keithito.com/LJ-Speech-Dataset/) | 1 | ~2.6 GB | single speaker — combine with others |
+| VCTK *(default)* | 110 | ~11 GB | `datasets/VCTK-Corpus-0.92/wav48_silence_trimmed` |
+| LibriSpeech `train-clean-100` | 251 | ~6.3 GB | `datasets/LibriSpeech/train-clean-100` |
 
-### What `SpeakerDataset` does internally
+</details>
 
-For each training sample:
-1. Picks a random **source speaker** and a random **target speaker**
-2. Picks a random audio file from each
-3. Picks `N_CTX=5` additional files from the target speaker as reference context
-4. Returns `source_audio`, `target_audio`, and `context_mels` (log-mel spectrograms of the references)
-
-The 90 / 10 train / val speaker split is deterministic (seeded), so the same speakers always go to the same split.
-
-### Using it directly in code
+<details>
+<summary>Direct Python API</summary>
 
 ```python
 from dataset import SpeakerDataset, collate_fn
 from torch.utils.data import DataLoader
 
-ds = SpeakerDataset("data", split="train")
+ds     = SpeakerDataset("datasets/VCTK-Corpus-0.92/wav48_silence_trimmed", split="train")
 loader = DataLoader(ds, batch_size=8, collate_fn=collate_fn, shuffle=True)
 
 batch = next(iter(loader))
@@ -339,108 +294,92 @@ print(batch["target_audio"].shape)   # [B, T_tgt]
 print(batch["context_mels"].shape)   # [B, N_CTX, 80, T_ctx]
 ```
 
+</details>
+
 ---
 
-## `train.py` — Training
+## Training — `train.py`
 
-Trains the three trainable modules (ContextEncoder, CrossAttentionFusion, MelDecoder) with AMP mixed precision and gradient accumulation.
+Trains ContextEncoder, CrossAttentionFusion, and MelDecoder with FP16 AMP and gradient accumulation. ContentEncoder and HiFi-GAN remain frozen throughout.
 
 ```bash
-# VCTK default — no flags needed after downloading into datasets/
-python train.py
-
-# Any other dataset
-python train.py --data-root datasets/my_data
+python train.py                               # VCTK default
+python train.py --data-root datasets/my_data  # custom dataset
+python train.py --reset                       # ignore existing checkpoint
 ```
+
+Checkpoints are written to `checkpoints/`:
+- `latest.pt` — every 1 000 steps, used for resuming
+- `best.pt` — whenever validation loss improves, used for inference
+
+### Qualitative audio samples
+
+Every `SAVE_EVERY` steps, validation saves three WAV files to `checkpoints/samples/step_{N}/`:
+
+| File | Content |
+|---|---|
+| `source.wav` | Raw source speaker audio from the first validation batch |
+| `target.wav` | Raw target speaker audio from the first validation batch |
+| `converted.wav` | Source content + target speaker C, decoded through HiFi-GAN |
+
+`converted.wav` feeds **source** audio into the content encoder (not target), mirroring real inference rather than the self-reconstruction loss path. Use it to track cross-speaker generalisation: early in training it will sound like the source; as training progresses it should shift toward the target speaker's voice characteristics.
+
+<details>
+<summary>CLI flags and key constants</summary>
 
 | Flag | Default | Description |
 |---|---|---|
-| `--data-root` | `datasets/VCTK-Corpus-0.92/wav48_silence_trimmed` | Root folder containing speaker sub-directories |
-| `--output-dir` | `checkpoints` | Where to save `.pt` checkpoint files |
+| `--data-root` | `datasets/VCTK-Corpus-0.92/wav48_silence_trimmed` | Speaker folder root |
+| `--output-dir` | `checkpoints` | Checkpoint and sample output directory |
 | `--num-workers` | `4` | DataLoader worker processes |
-| `--reset` | off | Ignore existing checkpoint, train from scratch |
+| `--reset` | off | Train from scratch, ignoring existing checkpoint |
 
-**Key constants (edit at the top of `train.py`):**
+Key constants at the top of `train.py`:
 
 ```python
 BATCH_SIZE    = 32       # physical batch per GPU step
 GRAD_ACCUM    = 1        # effective batch = BATCH_SIZE × GRAD_ACCUM
-MAX_AUDIO_SEC = 8.0      # clip length — increase to fill more VRAM
+MAX_AUDIO_SEC = 8.0      # clip length — increase to use more VRAM
 MAX_STEPS     = 100_000
 LR            = 1e-4
 WARMUP_STEPS  = 1_000
+SAVE_EVERY    = 1_000    # validation + checkpoint + audio sample interval
 ```
 
-Checkpoints:
-- `checkpoints/latest.pt` — saved every 1 000 steps, used for resuming
-- `checkpoints/best.pt` — saved whenever validation loss improves, used for inference
-
-```bash
-# Resume from latest checkpoint automatically
-python train.py
-
-# Start fresh
-python train.py --reset
-```
+</details>
 
 ---
 
-## `mic_convert.py` — Real-Time Microphone Conversion
+## Real-Time Inference — `mic_convert.py`
 
-Runs the full pipeline locally on your GPU with no server. Two phases:
-
-- **Phase 1:** Record a few seconds of the target speaker from the microphone (or load a WAV file) → computes context vector **C**
-- **Phase 2:** Your microphone is streamed in real time → converted to the target speaker's voice → played through your speakers
-
-```
-Microphone
-    │  [1024 samples @ 16 kHz per callback]
-    ▼
-mic_queue
-    │
-    ▼
-Inference thread   ← accumulates 3200 samples, runs model.convert_chunk()
-    │
-    ▼
-Jitter buffer  (5-chunk pre-fill before playback starts)
-    │
-    ▼
-Speaker output
-```
-
-### Commands
+Runs the full pipeline locally — no server required. Phase 1 computes the target speaker embedding **C** from a recording or WAV file. Phase 2 streams your microphone through the model in real time.
 
 ```bash
-# See available mic/speaker device indices
-python mic_convert.py --list-devices
-
-# Record 5s of target voice from mic, then convert
-python mic_convert.py --checkpoint checkpoints/best.pt
-
-# Use a WAV file as reference (skip mic recording)
-python mic_convert.py --checkpoint checkpoints/best.pt --reference alice.wav
-
-# Record a longer reference for better quality
-python mic_convert.py --checkpoint checkpoints/best.pt --record-seconds 10
-
-# Specify audio devices by index
-python mic_convert.py --checkpoint checkpoints/best.pt --device-in 1 --device-out 3
+python mic_convert.py --list-devices                              # list device indices
+python mic_convert.py --checkpoint checkpoints/best.pt            # record 5s reference from mic
+python mic_convert.py --checkpoint checkpoints/best.pt --reference alice.wav  # use WAV
 ```
 
 Press `Ctrl+C` to stop.
 
-### All flags
+<details>
+<summary>All flags and latency breakdown</summary>
 
 | Flag | Default | Description |
 |---|---|---|
 | `--checkpoint` | `checkpoints/best.pt` | Trained model checkpoint |
-| `--reference` | *(none)* | WAV file to use as reference instead of recording from mic |
-| `--record-seconds` | `5` | How many seconds to record from mic for the reference |
-| `--device-in` | system default | Input (microphone) device index |
-| `--device-out` | system default | Output (speaker) device index |
+| `--reference` | *(none)* | WAV file to use as reference instead of recording |
+| `--record-seconds` | `5` | Seconds to record from mic for the reference |
+| `--device-in` | system default | Microphone device index |
+| `--device-out` | system default | Speaker device index |
 | `--list-devices` | — | Print available audio devices and exit |
 
-### Latency
+**Pipeline:**
+
+```
+Microphone  →  mic_queue  →  Inference thread  →  Jitter buffer  →  Speaker
+[1024 samples/callback]   [accumulate 3200]   [5-chunk pre-fill]
+```
 
 | Stage | Time |
 |---|---|
@@ -449,53 +388,51 @@ Press `Ctrl+C` to stop.
 | Jitter buffer pre-fill (5 chunks) | ~320 ms |
 | **Total steady-state** | **~250 ms** |
 
-To reduce latency, lower `PROC_SAMPLES` in `mic_convert.py` (e.g. `1600` = 100 ms window) at the cost of slightly lower quality at chunk boundaries.
+To reduce latency, lower `PROC_SAMPLES` in `mic_convert.py` (e.g. `1600` = 100 ms) at the cost of slightly worse chunk-boundary quality.
+
+</details>
 
 ---
 
-## `convert.py` — Offline File Conversion
+## Offline Inference — `convert.py`
 
-Converts an audio file to a target speaker's voice without a microphone or server. Useful for testing a trained checkpoint before doing real-time use.
+Converts an audio file without a microphone or server. Useful for evaluating a checkpoint before moving to real-time use.
 
 ```bash
-# Single reference file
-python convert.py \
-    --source   my_voice.wav \
-    --reference alice.wav \
-    --checkpoint checkpoints/best.pt \
-    --output   converted.wav
-
-# Multiple reference files → more robust speaker embedding
-python convert.py \
-    --source   my_voice.wav \
-    --reference alice_01.wav alice_02.wav alice_03.wav \
-    --output   converted.wav
+python convert.py --source me.wav --reference alice.wav --output converted.wav
+python convert.py --source me.wav --reference alice_1.wav alice_2.wav alice_3.wav --output converted.wav
 ```
 
-### All flags
+<details>
+<summary>All flags</summary>
 
 | Flag | Default | Description |
 |---|---|---|
-| `--source` | *(required)* | Audio file to convert (any format) |
+| `--source` | *(required)* | Audio file to convert |
 | `--reference` | *(required)* | One or more reference WAV files from the target speaker |
 | `--checkpoint` | `checkpoints/best.pt` | Trained model checkpoint |
 | `--output` | `converted.wav` | Output file path |
 
-The script processes audio in 4-second chunks, printing progress as it goes. Long files are fully supported.
+Audio is processed in 4-second chunks. Long files are fully supported.
+
+</details>
 
 ---
 
 ## Networked Mode (Optional)
 
-For use across machines — e.g. a WSL2 GPU server with a Windows mic client. Not needed for local use.
+For use across machines — e.g. a WSL2 GPU server with a Windows mic client. Not required for local use.
 
-### Start server (WSL2)
+<details>
+<summary>Server and client setup</summary>
+
+**Start server (WSL2):**
 
 ```bash
 uvicorn server.app:app --host 0.0.0.0 --port 8000
 ```
 
-### Register a speaker and stream (Windows)
+**Register a speaker and stream (Windows):**
 
 ```powershell
 pip install pipwin && pipwin install pyaudio
@@ -509,27 +446,41 @@ python client/stream_client.py `
     --register-wav alice.wav
 ```
 
+</details>
+
 ---
 
 ## Implementation Notes
 
-### Freezing frozen modules
-`VoiceConversionModel.train()` is overridden to re-apply `.eval()` and `requires_grad_(False)` on `ContentEncoder` and `HiFiGANVocoder` after every call to `.train()`. This prevents PyTorch's mode propagation from accidentally enabling gradients in frozen submodules during the training loop.
+<details>
+<summary>Critical details for modifying the code</summary>
 
-### DeepFilterNet3 sample rate
-DFN3 operates at 48 kHz internally. `content_encoder.py` resamples around it:
+**Frozen modules must stay in eval mode**
+`VoiceConversionModel.train()` is overridden to re-call `.eval()` on `content_encoder` and `vocoder` immediately after `super().train()`. PyTorch's `.train()` propagates to all submodules — without this override it would accidentally enable dropout and BatchNorm in HuBERT and HiFi-GAN. If you add a new frozen submodule, add it to that override.
+
+**DeepFilterNet3 runs at 48 kHz**
+DFN3 operates internally at 48 kHz. The content encoder resamples around it:
 ```
 16 kHz → 48 kHz → DeepFilterNet3 → 16 kHz → HuBERT
 ```
+Feeding 16 kHz directly into DFN3 produces silent garbage with no error.
 
-### DeepFilterNet3 GRU state
-DFN3 has stateful GRU layers. `reset_dfn_state()` is called **once per session** and must persist across all chunks of that session. Resetting between chunks breaks temporal continuity.
+**DeepFilterNet3 GRU state**
+`reset_dfn_state()` must be called **once per audio session** — when a WebSocket connection opens or when `mic_convert.py` starts. Do not call it between chunks; the GRU hidden state carries temporal context across chunks.
 
-### HuBERT layer index
-`HUBERT_BASE.extract_features()` returns 12 tensors. Index `5` (0-based) = transformer layer 6, which encodes mid-level linguistic content.
+**HuBERT layer index**
+`HUBERT_BASE.extract_features()` returns a list of 12 tensors (one per transformer layer). Index `5` (0-based) is transformer layer 6 — the correct layer for mid-level linguistic content.
 
-### F0 frame alignment
-`torchcrepe.predict(..., hop_length=320)` matches HuBERT's 320-sample stride. Both produce `T // 320` frames, allowing direct concatenation into `[B, T_frames, 769]`.
+**F0 frame alignment**
+`torchcrepe.predict(..., hop_length=320)` and HuBERT both have a 320-sample stride, producing `T // 320` frames each. If you ever change one, change both — mismatched strides cause silent feature misalignment at concatenation.
+
+**HiFi-GAN input format**
+The decoder outputs `[B, T_mel, 80]` (channels-last). HiFi-GAN expects `[B, 80, T_mel]` (channels-first). Always transpose before calling the vocoder: `vocoder(mel.transpose(1, 2))`.
+
+**Gradient accumulation — scale all loss terms**
+The training loss is divided by `GRAD_ACCUM` before `.backward()`. If you add a second loss term (e.g. speaker loss), apply the same scaling: `(l1 + 0.1 * spk_loss) / GRAD_ACCUM`. Forgetting this makes the effective learning rate `GRAD_ACCUM×` too large.
+
+</details>
 
 ---
 
@@ -538,14 +489,14 @@ DFN3 has stateful GRU layers. `reset_dfn_state()` is called **once per session**
 ```bash
 conda activate voice
 
-# Check CUDA
+# CUDA check
 python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
 
 # Model shape smoke test (no checkpoint needed)
 python - <<'EOF'
 import torch
 from core.model import VoiceConversionModel
-m = VoiceConversionModel(torch.device("cuda"))
+m   = VoiceConversionModel(torch.device("cuda"))
 audio = torch.randn(1, 3200).cuda()
 C     = torch.randn(1, 256).cuda()
 out   = m.convert_chunk(audio, C)

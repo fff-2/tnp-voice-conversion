@@ -154,7 +154,7 @@ def train(args) -> None:
 
                 # ── Content encoding (frozen, no grad) ────────────────────────
                 with torch.no_grad():
-                    content = model.content_encoder(source) # [B, T_frames, 769]
+                    content = model.content_encoder(target) # [B, T_frames, 769]
 
                 # ── Cross-attention + decode ──────────────────────────────────
                 fused = model.cross_attention(content, C)   # [B, T_frames, D_MODEL]
@@ -239,7 +239,7 @@ def _validate(
         with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
             C_all = model.context_encoder(ctx_flat)
             C = C_all.view(B, N, -1).mean(dim=1)
-            content = model.content_encoder(source)
+            content = model.content_encoder(target)
             fused = model.cross_attention(content, C)
             pred_mel = model.decoder(fused)
             tgt_mel = mel_transform(target).transpose(1, 2)

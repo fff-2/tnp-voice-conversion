@@ -123,6 +123,66 @@ SOURCE SPEAKER (live mic / audio file)
 
 ---
 
+## Training Strategy
+
+### The non-parallel data problem
+
+Voice conversion requires training a model that separates *what* is said (phonetic content) from *who* says it (speaker identity), then recombines them. The obvious approach — feeding source audio in, comparing against a recording of a different speaker saying the exact same sentence — requires **parallel data**: transcribed sentence-aligned recordings across every speaker pair. Parallel corpora are rare and expensive to collect.
+
+VCTK and LibriSpeech are **non-parallel**: each speaker says different sentences. You cannot compute a meaningful L1 loss between "Speaker A saying *apple*" and "Speaker B saying *banana*" — their mel spectrograms have nothing to compare frame-by-frame.
+
+### Self-reconstruction
+
+The training loop uses a **self-reconstruction** objective to sidestep this entirely.
+
+During training the content encoder receives the **target audio**, not the source:
+
+```
+Training forward pass
+─────────────────────────────────────────────────────────────
+target_audio  ──→  [ContentEncoder (frozen)]  ──→  content features
+                         (HuBERT strips speaker identity,
+                          preserves phonetics)
+
+context_mels  ──→  [ContextEncoder]  ──→  C  (target speaker embedding)
+
+content + C   ──→  [CrossAttention + Decoder]  ──→  pred_mel
+
+Loss:  L1( pred_mel,  mel(target_audio) )   ← both sides are the target
+```
+
+Because both the prediction and the ground truth are derived from the same utterance, the loss is phonetically valid. The model must learn to inject speaker identity from `C` into the content features in order to reconstruct `target_mel`.
+
+At **inference time** the roles switch back to the intended conversion task:
+
+```
+Inference forward pass
+─────────────────────────────────────────────────────────────
+source_audio  ──→  [ContentEncoder]  ──→  content features (source phonetics)
+reference     ──→  [ContextEncoder]  ──→  C  (target speaker embedding)
+
+content + C   ──→  [CrossAttention + Decoder]  ──→  converted mel
+```
+
+### Why HuBERT makes this work
+
+HuBERT is pre-trained with a masked prediction objective on large-scale speech, causing its internal representations to correlate with phonemes more than with speaker acoustics. Feeding `target_audio` through HuBERT therefore produces a representation that carries the *content* of the utterance but has had much of the speaker-specific spectral detail discarded. Without that bottleneck, the model could learn to copy the input rather than synthesize it, and the context vector `C` would never be needed.
+
+### Copy-synthesis risk
+
+HuBERT is not a perfect disentangler — layer-6 features still carry some speaker identity. If the cross-attention can exploit that residual signal to reconstruct the target without consulting `C`, the model learns *copy synthesis*: it appears to reconstruct well during training but fails at inference because it ignores `C` when the source speaker differs.
+
+Signs of copy synthesis at inference:
+- Converted output sounds like the **source** speaker, not the target
+- Validation loss is low but perceptual quality of cross-speaker conversion is poor
+
+Mitigations (in increasing complexity):
+1. **Information bottleneck** — add a narrow FC layer or vector quantization (VQ) between the content encoder and cross-attention to hard-limit the information throughput
+2. **Speaker perturbation** — randomly pitch-shift or formant-shift `target_audio` before feeding it to the content encoder, so the model cannot rely on absolute spectral values for speaker identity
+3. **Speaker adversarial loss** — add a speaker classifier head on the content features and train it adversarially to remove speaker information from the content path
+
+---
+
 ## Hardware Requirements
 
 - **GPU:** NVIDIA RTX 5060 Ti (16 GB VRAM) or equivalent

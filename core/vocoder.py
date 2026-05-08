@@ -1,24 +1,25 @@
 import torch
 import torch.nn as nn
-import torchaudio
 from torch import Tensor
+from vocos import Vocos
 
 
-class HiFiGANVocoder(nn.Module):
+class VocosVocoder(nn.Module):
     """
-    Frozen HiFiGAN vocoder wrapper using torchaudio's pretrained model.
+    Frozen Vocos vocoder (charactr/vocos-mel-24khz).
 
-    Input:  mel spectrogram [B, n_mels, T_mel]  channels-first, 100 Hz frame rate
-    Output: waveform        [B, 1, T_mel * 160]  16 kHz float32 in [-1, 1]
+    Input:  log-mel [B, 100, T_mel]  24000 Hz / n_fft 1024 / hop 256
+    Output: waveform [B, 1, T_wav]   24000 Hz float32 in [-1, 1]
 
-    Frame rate 100 Hz × hop_size 160 = 16 000 Hz sample rate.
-    All parameters are frozen (requires_grad=False, eval mode).
+    Log scale: log(mel.clamp(min=1e-5)) — matches vocos training convention.
+    All parameters are frozen.
     """
+
+    SAMPLE_RATE = 24_000
 
     def __init__(self, device: torch.device) -> None:
         super().__init__()
-        bundle = torchaudio.pipelines.HIFIGAN_16K_100HZ
-        self.model = bundle.get_vocoder().to(device)   # ~50 MB download, cached
+        self.model = Vocos.from_pretrained("charactr/vocos-mel-24khz").to(device)
         self._freeze()
 
     def _freeze(self) -> None:
@@ -26,7 +27,6 @@ class HiFiGANVocoder(nn.Module):
             p.requires_grad_(False)
         self.model.eval()
 
-    # Keep eval mode even when parent calls .train()
     def train(self, mode: bool = True):
         super().train(mode)
         self.model.eval()
@@ -36,8 +36,9 @@ class HiFiGANVocoder(nn.Module):
     def forward(self, mel: Tensor) -> Tensor:
         """
         Args:
-            mel: [B, n_mels, T_mel]  log-compressed mel, channels-first
+            mel: [B, n_mels, T_mel]  log-compressed, channels-first
         Returns:
-            wav: [B, 1, T_mel * 160]  waveform float32
+            wav: [B, 1, T_wav]  waveform float32
         """
-        return self.model(mel)
+        wav = self.model.decode(mel)   # [B, T_wav]
+        return wav.unsqueeze(1)        # [B, 1, T_wav]

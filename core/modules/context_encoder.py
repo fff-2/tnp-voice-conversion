@@ -32,7 +32,7 @@ class ContextEncoder(nn.Module):
 
     def __init__(
         self,
-        n_mels: int = 80,
+        n_mels: int = 100,
         d_model: int = 256,
         nhead: int = 4,
         num_layers: int = 4,

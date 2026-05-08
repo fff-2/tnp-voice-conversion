@@ -36,7 +36,7 @@ class MelDecoder(nn.Module):
     def __init__(
         self,
         d_model: int = 256,
-        n_mels: int = 80,
+        n_mels: int = 100,
         n_conv_blocks: int = 3,
         n_transformer_layers: int = 2,
         nhead: int = 4,
@@ -59,8 +59,8 @@ class MelDecoder(nn.Module):
             for _ in range(n_transformer_layers)
         ])
         self.out_norm = nn.LayerNorm(d_model)
-        # 2× temporal upsample: 50 Hz → 100 Hz to match HiFiGAN hop_length=160 @ 16kHz
-        self.upsample = nn.Upsample(scale_factor=2, mode="linear", align_corners=False)
+        # Upsample HuBERT 50 Hz frames → Vocos 93.75 Hz (24000 Hz / hop 256)
+        self.upsample = nn.Upsample(scale_factor=24000 / (256 * 50), mode="linear", align_corners=False)
         self.out_proj = nn.Linear(d_model, n_mels)
 
     def forward(self, x: Tensor) -> Tensor:

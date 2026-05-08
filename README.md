@@ -71,9 +71,9 @@ voice/
 │   │   ├── context_encoder.py  # Transformer mean-pool → C [256]
 │   │   ├── content_encoder.py  # DeepFilterNet3 + HuBERT + torchcrepe F0
 │   │   ├── cross_attention.py  # Q=content, K/V=C
-│   │   └── decoder.py          # Conv1d + Transformer + 2× upsample → Mel [80]
+│   │   └── decoder.py          # Conv1d + Transformer + 1.875× upsample → Mel [100]
 │   ├── model.py                # Full pipeline wrapper
-│   └── vocoder.py              # HiFi-GAN wrapper (frozen)
+│   └── vocoder.py              # Vocos vocoder wrapper (frozen, 24 kHz)
 │
 ├── server/app.py               # Optional FastAPI + WebSocket server
 └── client/stream_client.py     # Optional PyAudio client for networked server
@@ -91,7 +91,7 @@ TARGET SPEAKER (reference audio)
         ▼
 ┌─────────────────────┐
 │   Context Encoder   │  Transformer (4 layers) + Mean Pool
-│     (Trainable)     │  [B, 80, T_ctx] → C [B, 256]
+│     (Trainable)     │  [B, 100, T_ctx] → C [B, 256]
 └─────────────────────┘
         │  C (computed once, cached per speaker)
         ▼
@@ -100,7 +100,7 @@ SOURCE SPEAKER (live mic / audio file)
         ▼
 ┌─────────────────────┐
 │   Content Encoder   │  DeepFilterNet3 → HuBERT (layer 6) → torchcrepe F0
-│      (Frozen)       │  [B, T] → [B, T_frames, 769]
+│      (Frozen)       │  [B, T @ 16 kHz] → [B, T_frames, 769]
 └─────────────────────┘
         │
         ▼
@@ -111,14 +111,14 @@ SOURCE SPEAKER (live mic / audio file)
         │
         ▼
 ┌─────────────────────┐
-│    Mel Decoder      │  Conv1d × 3 + Transformer × 2 + 2× upsample
-│    (Trainable)      │  [B, T_frames, 256] → [B, T_mel, 80]
+│    Mel Decoder      │  Conv1d × 3 + Transformer × 2 + 1.875× upsample
+│    (Trainable)      │  [B, T_frames, 256] → [B, T_mel, 100]
 └─────────────────────┘
         │
         ▼
 ┌─────────────────────┐
-│   HiFi-GAN Vocoder  │  torchaudio HIFIGAN_16K_100HZ (frozen)
-│      (Frozen)       │  [B, 80, T_mel] → [B, 1, T_wav]
+│   Vocos Vocoder     │  charactr/vocos-mel-24khz (frozen)
+│      (Frozen)       │  [B, 100, T_mel] → [B, 1, T_wav @ 24 kHz]
 └─────────────────────┘
         │
         ▼
@@ -129,10 +129,10 @@ SOURCE SPEAKER (live mic / audio file)
 |---|---|---|
 | ContextEncoder | Yes | ~3.1 M |
 | CrossAttentionFusion | Yes | ~460 K |
-| MelDecoder | Yes | ~2.2 M |
+| MelDecoder | Yes | ~3.2 M |
 | ContentEncoder (DFN3 + HuBERT + crepe) | No | ~122 M |
-| HiFiGANVocoder | No | ~13.9 M |
-| **Total trainable** | | **~5.8 M (~22 MB fp32)** |
+| VocosVocoder | No | ~13.4 M |
+| **Total trainable** | | **~6.8 M (~26 MB fp32)** |
 
 ---
 
@@ -244,7 +244,7 @@ conda env create -f environment.yml
 
 `SpeakerDataset` loads audio from any folder of speaker sub-directories. No parallel recordings, no matched filenames, no special naming convention. Any sample rate is auto-resampled to 16 kHz. Minimum: **2 speakers**, **7 files each**.
 
-For each training sample it picks a random source speaker, a random target speaker, and `N_CTX=5` reference utterances from the target speaker.
+For each training sample it picks a random source speaker, a random target speaker, and `N_CTX=5` reference utterances from the target speaker. Context mels are computed at 24 kHz (100-band log-mel, `n_fft=1024`, `hop=256`) to match the Vocos vocoder.
 
 <details>
 <summary>Dataset options and download commands</summary>
@@ -300,7 +300,7 @@ loader = DataLoader(ds, batch_size=8, collate_fn=collate_fn, shuffle=True)
 batch = next(iter(loader))
 print(batch["source_audio"].shape)   # [B, T_src]
 print(batch["target_audio"].shape)   # [B, T_tgt]
-print(batch["context_mels"].shape)   # [B, N_CTX, 80, T_ctx]
+print(batch["context_mels"].shape)   # [B, N_CTX, 100, T_ctx]
 ```
 
 </details>
@@ -309,7 +309,7 @@ print(batch["context_mels"].shape)   # [B, N_CTX, 80, T_ctx]
 
 ## Training — `train.py`
 
-Trains ContextEncoder, CrossAttentionFusion, and MelDecoder with FP16 AMP and gradient accumulation. ContentEncoder and HiFi-GAN remain frozen throughout.
+Trains ContextEncoder, CrossAttentionFusion, and MelDecoder with FP16 AMP and gradient accumulation. ContentEncoder and Vocos remain frozen throughout.
 
 ```bash
 python train.py                               # VCTK default
@@ -321,15 +321,17 @@ Checkpoints are written to `checkpoints/`:
 - `latest.pt` — every 1 000 steps, used for resuming
 - `best.pt` — whenever validation loss improves, used for inference
 
+To resume training from the last checkpoint, just run `python train.py` again — it picks up `checkpoints/latest.pt` automatically.
+
 ### Qualitative audio samples
 
 Every `SAVE_EVERY` steps, validation saves three WAV files to `checkpoints/samples/step_{N}/`:
 
 | File | Content |
 |---|---|
-| `source.wav` | Raw source speaker audio from the first validation batch |
-| `target.wav` | Raw target speaker audio from the first validation batch |
-| `converted.wav` | Source content + target speaker C, decoded through HiFi-GAN |
+| `source.wav` | Raw source speaker audio from the first validation batch (16 kHz) |
+| `target.wav` | Raw target speaker audio from the first validation batch (16 kHz) |
+| `converted.wav` | Source content + target speaker C, decoded through Vocos (24 kHz) |
 
 `converted.wav` feeds **source** audio into the content encoder (not target), mirroring real inference rather than the self-reconstruction loss path. Use it to track cross-speaker generalisation: early in training it will sound like the source; as training progresses it should shift toward the target speaker's voice characteristics.
 
@@ -340,13 +342,13 @@ Every `SAVE_EVERY` steps, validation saves three WAV files to `checkpoints/sampl
 |---|---|---|
 | `--data-root` | `datasets/VCTK-Corpus-0.92/wav48_silence_trimmed` | Speaker folder root |
 | `--output-dir` | `checkpoints` | Checkpoint and sample output directory |
-| `--num-workers` | `4` | DataLoader worker processes |
+| `--num-workers` | `8` | DataLoader worker processes |
 | `--reset` | off | Train from scratch, ignoring existing checkpoint |
 
 Key constants at the top of `train.py`:
 
 ```python
-BATCH_SIZE    = 32       # physical batch per GPU step
+BATCH_SIZE    = 40       # physical batch per GPU step
 GRAD_ACCUM    = 1        # effective batch = BATCH_SIZE × GRAD_ACCUM
 MAX_AUDIO_SEC = 8.0      # clip length — increase to use more VRAM
 MAX_STEPS     = 100_000
@@ -399,6 +401,8 @@ Microphone  →  mic_queue  →  Inference thread  →  Jitter buffer  →  Spea
 
 To reduce latency, lower `PROC_SAMPLES` in `mic_convert.py` (e.g. `1600` = 100 ms) at the cost of slightly worse chunk-boundary quality.
 
+Vocos outputs at 24 kHz; the processing thread resamples back to 16 kHz for playback so you can use a standard 16 kHz output device.
+
 </details>
 
 ---
@@ -422,7 +426,7 @@ python convert.py --source me.wav --reference alice_1.wav alice_2.wav alice_3.wa
 | `--checkpoint` | `checkpoints/best.pt` | Trained model checkpoint |
 | `--output` | `converted.wav` | Output file path |
 
-Audio is processed in 4-second chunks. Long files are fully supported.
+Audio is processed in 4-second chunks. Long files are fully supported. Output is saved at 24 kHz (Vocos native sample rate).
 
 </details>
 
@@ -465,7 +469,10 @@ python client/stream_client.py `
 <summary>Critical details for modifying the code</summary>
 
 **Frozen modules must stay in eval mode**
-`VoiceConversionModel.train()` is overridden to re-call `.eval()` on `content_encoder` and `vocoder` immediately after `super().train()`. PyTorch's `.train()` propagates to all submodules — without this override it would accidentally enable dropout and BatchNorm in HuBERT and HiFi-GAN. If you add a new frozen submodule, add it to that override.
+`VoiceConversionModel.train()` is overridden to re-call `.eval()` on `content_encoder` and `vocoder` immediately after `super().train()`. PyTorch's `.train()` propagates to all submodules — without this override it would accidentally enable dropout and BatchNorm in HuBERT and Vocos. If you add a new frozen submodule, add it to that override.
+
+**Dual sample rates**
+The content encoder (DFN3 + HuBERT + crepe) operates at **16 kHz**. The mel computation and Vocos vocoder operate at **24 kHz**. Audio is resampled 16 kHz → 24 kHz before the mel transform; the vocoder outputs native 24 kHz audio. Do not change the mel parameters (`n_fft=1024`, `hop_length=256`, `n_mels=100`) — they must match Vocos's training configuration exactly.
 
 **DeepFilterNet3 runs at 48 kHz**
 DFN3 operates internally at 48 kHz. The content encoder resamples around it:
@@ -483,11 +490,17 @@ Feeding 16 kHz directly into DFN3 produces silent garbage with no error.
 **F0 frame alignment**
 `torchcrepe.predict(..., hop_length=320)` and HuBERT both have a 320-sample stride, producing `T // 320` frames each. If you ever change one, change both — mismatched strides cause silent feature misalignment at concatenation.
 
-**HiFi-GAN input format**
-The decoder outputs `[B, T_mel, 80]` (channels-last). HiFi-GAN expects `[B, 80, T_mel]` (channels-first). Always transpose before calling the vocoder: `vocoder(mel.transpose(1, 2))`.
+**Vocos input format**
+The decoder outputs `[B, T_mel, 100]` (channels-last). Vocos expects `[B, 100, T_mel]` (channels-first). Always transpose before calling the vocoder: `vocoder(mel.transpose(1, 2))`.
+
+**Mel decoder upsample factor**
+HuBERT produces ~50 frames/s (stride 320 @ 16 kHz). Vocos requires ~93.75 frames/s (24 000 Hz / hop 256). The decoder uses `scale_factor = 24000 / (256 × 50) = 1.875` to bridge this gap.
 
 **Gradient accumulation — scale all loss terms**
 The training loss is divided by `GRAD_ACCUM` before `.backward()`. If you add a second loss term (e.g. speaker loss), apply the same scaling: `(l1 + 0.1 * spk_loss) / GRAD_ACCUM`. Forgetting this makes the effective learning rate `GRAD_ACCUM×` too large.
+
+**FP16 NaN losses**
+Occasional NaN losses during early training are normal AMP behaviour — the GradScaler detects overflow, skips the optimizer step, and reduces the loss scale automatically. Weights are unaffected. If NaN losses persist past step ~2 000, lower `LR` or switch to `bfloat16`.
 
 </details>
 
@@ -509,7 +522,7 @@ m   = VoiceConversionModel(torch.device("cuda"))
 audio = torch.randn(1, 3200).cuda()
 C     = torch.randn(1, 256).cuda()
 out   = m.convert_chunk(audio, C)
-print("Output shape:", out.shape)   # expect torch.Size([1, 1, 3200])
+print("Output shape:", out.shape)   # [1, 1, T_wav @ 24 kHz]
 EOF
 
 # Dataset smoke test
@@ -519,7 +532,7 @@ ds = SpeakerDataset("datasets/VCTK-Corpus-0.92/wav48_silence_trimmed", split="tr
 s  = ds[0]
 print("source_audio:", s["source_audio"].shape)
 print("target_audio:", s["target_audio"].shape)
-print("context_mels:", s["context_mels"].shape)
+print("context_mels:", s["context_mels"].shape)   # [N_CTX, 100, T_ctx]
 EOF
 ```
 
@@ -527,4 +540,4 @@ EOF
 
 ## License
 
-For research and personal use. Pre-trained models (HuBERT, HiFi-GAN, DeepFilterNet) are subject to their respective upstream licenses.
+For research and personal use. Pre-trained models (HuBERT, Vocos, DeepFilterNet) are subject to their respective upstream licenses.

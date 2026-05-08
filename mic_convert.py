@@ -47,7 +47,8 @@ from core.model import VoiceConversionModel
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 SR = 16_000
-N_MELS = 80
+VOCODER_SR = 24_000   # vocos output sample rate; output is resampled back to SR for playback
+N_MELS = 100
 CHUNK = 1024          # samples per audio callback frame  (~64 ms)
 PROC_SAMPLES = 3200   # accumulated before each inference (~200 ms)
 OVERLAP = 1600        # left-context fed to DFN/HuBERT to reduce edge artefacts
@@ -100,13 +101,13 @@ def load_wav_reference(path: str, device: torch.device) -> torch.Tensor:
 
 
 def audio_to_mel(audio: torch.Tensor, device: torch.device) -> torch.Tensor:
-    """[1, T] → [1, N_MELS, T_mel] log1p mel."""
+    """[1, T @ 16kHz] → [1, N_MELS, T_mel] log mel at 24000 Hz."""
+    audio_24k = AF.resample(audio, SR, VOCODER_SR)
     tf = torchaudio.transforms.MelSpectrogram(
-        sample_rate=SR, n_fft=1024, hop_length=160, win_length=1024,
-        n_mels=N_MELS, f_min=0.0, f_max=8000.0,
-        power=1.0, norm="slaney", mel_scale="slaney",
+        sample_rate=VOCODER_SR, n_fft=1024, hop_length=256, win_length=1024, n_mels=N_MELS,
     ).to(device)
-    return torch.log1p(tf(audio))
+    mel = tf(audio_24k)
+    return torch.log(mel.clamp(min=1e-5))
 
 
 # ── Real-time converter ───────────────────────────────────────────────────────
@@ -205,8 +206,11 @@ class RealtimeConverter:
                     .unsqueeze(0)
                     .to(self.torch_device)
                 )                                           # [1, PROC+OVERLAP]
-                wav = self.model.convert_chunk(audio_t, self.C)   # [1, 1, T_out]
-                out_np = wav.squeeze().cpu().numpy().astype(np.float32)
+                wav = self.model.convert_chunk(audio_t, self.C)   # [1, 1, T_out @ 24000 Hz]
+
+                # Resample vocoder output (24000 Hz) → playback rate (16000 Hz)
+                wav_16k = AF.resample(wav.squeeze(0), VOCODER_SR, SR)   # [1, T_16k]
+                out_np = wav_16k.squeeze().cpu().numpy().astype(np.float32)
                 np.clip(out_np, -1.0, 1.0, out=out_np)
 
                 # Discard the context prefix from the output

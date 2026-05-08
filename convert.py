@@ -20,6 +20,7 @@ import argparse
 import sys
 from pathlib import Path
 
+import soundfile as sf
 import torch
 import torchaudio
 import torchaudio.functional as AF
@@ -28,8 +29,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from core.model import VoiceConversionModel
 
 SAMPLE_RATE = 16_000
-N_MELS = 80
-CHUNK_SAMPLES = 16_000 * 4   # process 4-second chunks to fit in VRAM
+VOCODER_SR = 24_000          # vocos output sample rate
+N_MELS = 100
+CHUNK_SAMPLES = 16_000 * 4   # process 4-second chunks (content encoder at 16 kHz)
 
 
 def load_audio(path: str, device: torch.device) -> torch.Tensor:
@@ -43,14 +45,13 @@ def load_audio(path: str, device: torch.device) -> torch.Tensor:
 
 
 def audio_to_mel(audio: torch.Tensor, device: torch.device) -> torch.Tensor:
-    """[1, T] → [1, N_MELS, T_mel] log1p mel, on device."""
+    """[1, T @ 16kHz] → [1, N_MELS, T_mel] log mel at 24000 Hz, on device."""
+    audio_24k = AF.resample(audio, SAMPLE_RATE, VOCODER_SR)
     mel_transform = torchaudio.transforms.MelSpectrogram(
-        sample_rate=SAMPLE_RATE, n_fft=1024, hop_length=160, win_length=1024,
-        n_mels=N_MELS, f_min=0.0, f_max=8000.0,
-        power=1.0, norm="slaney", mel_scale="slaney",
+        sample_rate=VOCODER_SR, n_fft=1024, hop_length=256, win_length=1024, n_mels=N_MELS,
     ).to(device)
-    mel = mel_transform(audio)               # [1, N_MELS, T_mel]
-    return torch.log1p(mel)
+    mel = mel_transform(audio_24k)           # [1, N_MELS, T_mel]
+    return torch.log(mel.clamp(min=1e-5))
 
 
 def convert(args) -> None:
@@ -115,8 +116,8 @@ def convert(args) -> None:
 
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    torchaudio.save(str(out_path), output, SAMPLE_RATE)
-    print(f"\nSaved: {out_path}  ({output.shape[-1] / SAMPLE_RATE:.2f}s)")
+    sf.write(str(out_path), output[0].numpy(), VOCODER_SR)
+    print(f"\nSaved: {out_path}  ({output.shape[-1] / VOCODER_SR:.2f}s)")
 
 
 def main() -> None:

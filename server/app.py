@@ -38,10 +38,11 @@ from core.model import VoiceConversionModel
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 SAMPLE_RATE = 16_000
+VOCODER_SR = 24_000          # mel computation and vocoder output sample rate
 CLIENT_CHUNK = 1024          # float32 samples per WebSocket frame from client
 PROC_SAMPLES = 3200          # samples accumulated before each inference (200 ms)
 OVERLAP_SAMPLES = 1600       # left-context overlap to reduce edge artifacts (100 ms)
-N_MELS = 80
+N_MELS = 100
 
 # ── Global state ──────────────────────────────────────────────────────────────
 
@@ -78,16 +79,7 @@ async def startup() -> None:
     _model.eval()
 
     _mel_transform = torchaudio.transforms.MelSpectrogram(
-        sample_rate=SAMPLE_RATE,
-        n_fft=1024,
-        hop_length=160,
-        win_length=1024,
-        n_mels=N_MELS,
-        f_min=0.0,
-        f_max=8000.0,
-        power=1.0,
-        norm="slaney",
-        mel_scale="slaney",
+        sample_rate=VOCODER_SR, n_fft=1024, hop_length=256, win_length=1024, n_mels=N_MELS,
     ).to(_device)
 
     _executor = ThreadPoolExecutor(max_workers=4)
@@ -117,9 +109,10 @@ def _compute_context_sync(wav_bytes: bytes, speaker_id: str) -> torch.Tensor:
         waveform = torchaudio.functional.resample(waveform, sr, SAMPLE_RATE)
     waveform = waveform.to(_device)   # [1, T]
 
-    # Compute mel spectrogram
-    mel = _mel_transform(waveform)    # [1, N_MELS, T_mel]
-    mel = torch.log1p(mel)            # log1p compression
+    # Resample to 24000 Hz for mel (matches vocos-mel-24khz training params)
+    waveform_24k = torchaudio.functional.resample(waveform, SAMPLE_RATE, VOCODER_SR)
+    mel = _mel_transform(waveform_24k)             # [1, N_MELS, T_mel]
+    mel = torch.log(mel.clamp(min=1e-5))
 
     # Compute context vector
     C = _model.compute_context([mel])  # [1, D_MODEL]

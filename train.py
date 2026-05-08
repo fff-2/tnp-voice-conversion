@@ -2,19 +2,19 @@
 Training script for the voice conversion pipeline.
 
 Trains the three trainable modules (ContextEncoder, CrossAttentionFusion, MelDecoder)
-against frozen HuBERT content and HiFiGAN vocoder.
+against frozen HuBERT content encoder and Vocos vocoder.
 
 VRAM optimizations:
-    - AMP (torch.cuda.amp.autocast + GradScaler) for FP16 forward/backward
+    - AMP (torch.amp.autocast + GradScaler) for FP16 forward/backward
     - Gradient accumulation (physical batch=32, accumulate=1 → effective batch=32)
 
 Dataset layout (place datasets inside the datasets/ folder):
-    VCTK:       datasets/VCTK-Corpus-0.92/wav48_silence_trimmed/
+    VCTK:       datasets/wav48_silence_trimmed/
     LibriSpeech: datasets/LibriSpeech/train-clean-100/
     Custom:     datasets/<any-name>/<speaker>/clip.wav
 
 Usage:
-    python train.py --data-root datasets/VCTK-Corpus-0.92/wav48_silence_trimmed
+    python train.py --data-root datasets/wav48_silence_trimmed
 """
 
 import argparse
@@ -22,12 +22,12 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import soundfile as sf
 import torch
 import torch.nn.functional as F
 import torchaudio
 from loguru import logger
 from torch.utils.data import DataLoader
-from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from core.model import VoiceConversionModel
@@ -36,20 +36,22 @@ from dataset import SpeakerDataset, collate_fn
 # ── Hyperparameters ───────────────────────────────────────────────────────────
 
 SAMPLE_RATE = 16_000
-BATCH_SIZE = 32            # physical batch per GPU step — increase to fill VRAM
-GRAD_ACCUM = 1             # effective batch = BATCH_SIZE * GRAD_ACCUM = 32
+VOCODER_SR = 24_000  # mel computation and vocoder output sample rate
+BATCH_SIZE = 40  # physical batch per GPU step — increase to fill VRAM
+GRAD_ACCUM = 1  # effective batch = BATCH_SIZE * GRAD_ACCUM = 32
 MAX_STEPS = 100_000
 SAVE_EVERY = 1_000
 LOG_EVERY = 50
 WARMUP_STEPS = 1_000
 LR = 1e-4
 WEIGHT_DECAY = 1e-2
-MAX_AUDIO_SEC = 8.0        # longer clips → more HuBERT activations → more VRAM
-N_CTX = 5                  # number of context utterances per training sample
-N_MELS = 80
+MAX_AUDIO_SEC = 8.0  # longer clips → more HuBERT activations → more VRAM
+N_CTX = 5  # number of context utterances per training sample
+N_MELS = 100
 
 
 # ── LR schedule: linear warmup → cosine decay ────────────────────────────────
+
 
 def get_lr(step: int, warmup: int, max_steps: int, base_lr: float) -> float:
     if step < warmup:
@@ -59,6 +61,7 @@ def get_lr(step: int, warmup: int, max_steps: int, base_lr: float) -> float:
 
 
 # ── Training loop ─────────────────────────────────────────────────────────────
+
 
 def train(args) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -76,7 +79,7 @@ def train(args) -> None:
         weight_decay=WEIGHT_DECAY,
         betas=(0.9, 0.98),
     )
-    scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
+    scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
 
     # ── Checkpoint resume ─────────────────────────────────────────────────────
     output_dir = Path(args.output_dir)
@@ -96,7 +99,7 @@ def train(args) -> None:
 
     # ── Dataset & DataLoader ──────────────────────────────────────────────────
     train_ds = SpeakerDataset(args.data_root, split="train", max_sec=MAX_AUDIO_SEC)
-    val_ds   = SpeakerDataset(args.data_root, split="val",   max_sec=MAX_AUDIO_SEC)
+    val_ds = SpeakerDataset(args.data_root, split="val", max_sec=MAX_AUDIO_SEC)
 
     train_loader = DataLoader(
         train_ds,
@@ -106,6 +109,7 @@ def train(args) -> None:
         collate_fn=collate_fn,
         pin_memory=(device.type == "cuda"),
         drop_last=True,
+        prefetch_factor=4,
         persistent_workers=(args.num_workers > 0),
     )
     val_loader = DataLoader(
@@ -117,17 +121,21 @@ def train(args) -> None:
     )
 
     # ── Mel transform on GPU for target mel computation ───────────────────────
+    # Resample 16 kHz audio to 24000 Hz before mel (matches vocos-mel-24khz params)
+    mel_resampler = torchaudio.transforms.Resample(SAMPLE_RATE, VOCODER_SR).to(device)
     mel_transform = torchaudio.transforms.MelSpectrogram(
-        sample_rate=SAMPLE_RATE, n_fft=1024, hop_length=160, win_length=1024,
-        n_mels=N_MELS, f_min=0.0, f_max=8000.0, power=1.0,
-        norm="slaney", mel_scale="slaney",
+        sample_rate=VOCODER_SR,
+        n_fft=1024,
+        hop_length=256,
+        win_length=1024,
+        n_mels=N_MELS,
     ).to(device)
 
     def compute_target_mel(audio: torch.Tensor) -> torch.Tensor:
-        """[B, T] → [B, T_mel, N_MELS] log1p-compressed, channels-last."""
-        mel = mel_transform(audio)       # [B, N_MELS, T_mel]
-        mel = mel.transpose(1, 2)        # [B, T_mel, N_MELS]
-        return torch.log1p(mel)
+        """[B, T @ 16kHz] → [B, T_mel, N_MELS] log-compressed, channels-last."""
+        mel = mel_transform(mel_resampler(audio))  # [B, N_MELS, T_mel]
+        mel = mel.transpose(1, 2)  # [B, T_mel, N_MELS]
+        return torch.log(mel.clamp(min=1e-5))
 
     # ── Training loop ─────────────────────────────────────────────────────────
     optimizer.zero_grad()
@@ -139,30 +147,30 @@ def train(args) -> None:
             if step >= MAX_STEPS:
                 break
 
-            source = batch["source_audio"].to(device)       # [B, T_src]
-            target = batch["target_audio"].to(device)       # [B, T_tgt]
-            ctx_mels = batch["context_mels"].to(device)     # [B, N_CTX, N_MELS, T_ctx]
+            source = batch["source_audio"].to(device)  # [B, T_src]
+            target = batch["target_audio"].to(device)  # [B, T_tgt]
+            ctx_mels = batch["context_mels"].to(device)  # [B, N_CTX, N_MELS, T_ctx]
 
             B, N, M, T_ctx = ctx_mels.shape
             # Flatten context batch for context encoder
-            ctx_flat = ctx_mels.view(B * N, M, T_ctx)      # [B*N, N_MELS, T_ctx]
+            ctx_flat = ctx_mels.view(B * N, M, T_ctx)  # [B*N, N_MELS, T_ctx]
 
-            with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
+            with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
                 # ── Context encoding ──────────────────────────────────────────
-                C_all = model.context_encoder(ctx_flat)     # [B*N, D_MODEL]
-                C = C_all.view(B, N, -1).mean(dim=1)        # [B, D_MODEL]
+                C_all = model.context_encoder(ctx_flat)  # [B*N, D_MODEL]
+                C = C_all.view(B, N, -1).mean(dim=1)  # [B, D_MODEL]
 
                 # ── Content encoding (frozen, no grad) ────────────────────────
                 with torch.no_grad():
-                    content = model.content_encoder(target) # [B, T_frames, 769]
+                    content = model.content_encoder(target)  # [B, T_frames, 769]
 
                 # ── Cross-attention + decode ──────────────────────────────────
-                fused = model.cross_attention(content, C)   # [B, T_frames, D_MODEL]
-                pred_mel = model.decoder(fused)             # [B, T_mel_pred, N_MELS]
+                fused = model.cross_attention(content, C)  # [B, T_frames, D_MODEL]
+                pred_mel = model.decoder(fused)  # [B, T_mel_pred, N_MELS]
 
                 # ── Target mel ────────────────────────────────────────────────
                 with torch.no_grad():
-                    tgt_mel = compute_target_mel(target)    # [B, T_mel_tgt, N_MELS]
+                    tgt_mel = compute_target_mel(target)  # [B, T_mel_tgt, N_MELS]
 
                 # ── Align lengths & compute loss ──────────────────────────────
                 T = min(pred_mel.shape[1], tgt_mel.shape[1])
@@ -181,7 +189,9 @@ def train(args) -> None:
                     pg["lr"] = lr
 
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.get_trainable_params(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(
+                    model.get_trainable_params(), max_norm=1.0
+                )
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
@@ -195,8 +205,15 @@ def train(args) -> None:
 
                 # ── Checkpointing ─────────────────────────────────────────────
                 if step % SAVE_EVERY == 0:
-                    avg_loss = _validate(model, val_loader, device, mel_transform,
-                                         step=step, output_dir=output_dir)
+                    avg_loss = _validate(
+                        model,
+                        val_loader,
+                        device,
+                        mel_transform,
+                        mel_resampler,
+                        step=step,
+                        output_dir=output_dir,
+                    )
                     logger.info(f"Validation loss @ step {step}: {avg_loss:.4f}")
 
                     ckpt = {
@@ -213,7 +230,7 @@ def train(args) -> None:
                         torch.save(ckpt, output_dir / "best.pt")
                         logger.info(f"New best model saved (loss={best_loss:.4f})")
 
-                    model.train()   # restore training mode after validation
+                    model.train()  # restore training mode after validation
 
     logger.info(f"Training complete. Best validation loss: {best_loss:.4f}")
 
@@ -224,6 +241,7 @@ def _validate(
     loader: DataLoader,
     device: torch.device,
     mel_transform,
+    mel_resampler,
     step: int = 0,
     output_dir: Path = None,
 ) -> float:
@@ -240,14 +258,14 @@ def _validate(
         B, N, M, T_ctx = ctx_mels.shape
         ctx_flat = ctx_mels.view(B * N, M, T_ctx)
 
-        with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
+        with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
             C_all = model.context_encoder(ctx_flat)
             C = C_all.view(B, N, -1).mean(dim=1)
             content = model.content_encoder(target)
             fused = model.cross_attention(content, C)
             pred_mel = model.decoder(fused)
-            tgt_mel = mel_transform(target).transpose(1, 2)
-            tgt_mel = torch.log1p(tgt_mel)
+            tgt_mel = mel_transform(mel_resampler(target)).transpose(1, 2)
+            tgt_mel = torch.log(tgt_mel.clamp(min=1e-5))
             T = min(pred_mel.shape[1], tgt_mel.shape[1])
             loss = F.l1_loss(pred_mel[:, :T, :], tgt_mel[:, :T, :])
 
@@ -260,24 +278,27 @@ def _validate(
             sample_dir = output_dir / "samples" / f"step_{step}"
             sample_dir.mkdir(parents=True, exist_ok=True)
 
-            # Raw waveforms (take first item; source/target are [B, T])
-            torchaudio.save(str(sample_dir / "source.wav"),
-                            source[0:1].cpu(), SAMPLE_RATE)
-            torchaudio.save(str(sample_dir / "target.wav"),
-                            target[0:1].cpu(), SAMPLE_RATE)
+            # Raw waveforms at 16 kHz (first item of first batch)
+            sf.write(
+                str(sample_dir / "source.wav"), source[0, :].cpu().numpy(), SAMPLE_RATE
+            )
+            sf.write(
+                str(sample_dir / "target.wav"), target[0, :].cpu().numpy(), SAMPLE_RATE
+            )
 
-            # Converted: source content + target speaker C → vocoder
-            # Uses source (not target) to test cross-speaker generalisation,
-            # mirroring real inference rather than the self-reconstruction loss.
-            with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
+            # Converted: source content + target speaker C → vocoder (24000 Hz out)
+            with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
                 src_content = model.content_encoder(source[0:1])
                 src_fused = model.cross_attention(src_content, C[0:1])
                 src_mel = model.decoder(src_fused)
-                wav = model.vocoder(src_mel.transpose(1, 2))   # [1, 1, T_wav]
-            torchaudio.save(str(sample_dir / "converted.wav"),
-                            wav[0].cpu(), SAMPLE_RATE)
+                wav = model.vocoder(src_mel.transpose(1, 2))  # [1, 1, T_wav]
+            sf.write(
+                str(sample_dir / "converted.wav"),
+                wav[0, 0, :].cpu().numpy(),
+                VOCODER_SR,
+            )
 
-        if n >= 50:   # cap validation batches for speed
+        if n >= 50:  # cap validation batches for speed
             break
 
     return total_loss / max(1, n)
@@ -285,19 +306,25 @@ def _validate(
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train voice conversion model")
     parser.add_argument(
         "--data-root",
-        default="datasets/VCTK-Corpus-0.92/wav48_silence_trimmed",
-        help="Speaker folder root (default: datasets/VCTK-Corpus-0.92/wav48_silence_trimmed)",
+        default="datasets/wav48_silence_trimmed",
+        help="Speaker folder root (default: datasets/wav48_silence_trimmed)",
     )
-    parser.add_argument("--output-dir", default="checkpoints",
-                        help="Directory for saving checkpoints")
-    parser.add_argument("--num-workers", type=int, default=4,
-                        help="DataLoader worker count")
-    parser.add_argument("--reset", action="store_true",
-                        help="Ignore existing checkpoint and train from scratch")
+    parser.add_argument(
+        "--output-dir", default="checkpoints", help="Directory for saving checkpoints"
+    )
+    parser.add_argument(
+        "--num-workers", type=int, default=8, help="DataLoader worker count"
+    )
+    parser.add_argument(
+        "--reset",
+        action="store_true",
+        help="Ignore existing checkpoint and train from scratch",
+    )
     args = parser.parse_args()
     train(args)
 

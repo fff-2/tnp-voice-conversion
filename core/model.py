@@ -7,7 +7,7 @@ from core.modules.context_encoder import ContextEncoder
 from core.modules.content_encoder import ContentEncoder
 from core.modules.cross_attention import CrossAttentionFusion
 from core.modules.decoder import MelDecoder
-from core.vocoder import HiFiGANVocoder
+from core.vocoder import VocosVocoder
 
 
 class VoiceConversionModel(nn.Module):
@@ -15,18 +15,20 @@ class VoiceConversionModel(nn.Module):
     Full voice conversion pipeline.
 
     Trainable:  ContextEncoder, CrossAttentionFusion, MelDecoder  (~5.8M params)
-    Frozen:     ContentEncoder (DFN3 + HuBERT + torchcrepe), HiFiGANVocoder
+    Frozen:     ContentEncoder (DFN3 + HuBERT + torchcrepe), VocosVocoder
 
-    Training forward pass:
-        forward(source_audio, context_mel, target_audio) → (pred_mel, target_mel)
+    Content encoder operates at 16 kHz.
+    Mel spectrogram (context encoder, decoder target, vocoder) operates at 24000 Hz.
 
     Inference:
         1. compute_context(reference_mels) → C  (once per speaker)
-        2. convert_chunk(audio_chunk, C) → waveform  (per streaming chunk)
+        2. convert_chunk(audio_chunk, C) → waveform at 24000 Hz  (per streaming chunk)
     """
 
-    N_MELS = 80
+    N_MELS = 100
     D_MODEL = 256
+    CONTENT_SR = 16_000    # sample rate for content encoder (HuBERT / DFN3)
+    VOCODER_SR = 24_000    # sample rate for mel computation and vocoder output
 
     def __init__(self, device: torch.device) -> None:
         super().__init__()
@@ -54,21 +56,21 @@ class VoiceConversionModel(nn.Module):
 
         # Frozen modules
         self.content_encoder = ContentEncoder(device=device)
-        self.vocoder = HiFiGANVocoder(device=device)
+        self.vocoder = VocosVocoder(device=device)
 
-        # Mel transform used during training to produce ground-truth mels.
-        # hop_length=160 @ 16kHz → 100 Hz frame rate, matching HiFiGAN.
+        # Resample 16 kHz audio → 24000 Hz for mel computation
+        self.resampler = torchaudio.transforms.Resample(
+            self.CONTENT_SR, self.VOCODER_SR
+        ).to(device)
+
+        # Mel transform matching vocos-mel-24khz training parameters:
+        # torchaudio defaults (power=2, htk scale, no norm) + log(x.clamp(1e-5))
         self.mel_transform = torchaudio.transforms.MelSpectrogram(
-            sample_rate=16_000,
+            sample_rate=self.VOCODER_SR,
             n_fft=1024,
-            hop_length=160,
+            hop_length=256,
             win_length=1024,
             n_mels=self.N_MELS,
-            f_min=0.0,
-            f_max=8000.0,
-            power=1.0,
-            norm="slaney",
-            mel_scale="slaney",
         ).to(device)
 
         self.to(device)
@@ -90,11 +92,12 @@ class VoiceConversionModel(nn.Module):
     def _compute_mel(self, audio: Tensor) -> Tensor:
         """
         Args:    audio: [B, T]  16 kHz PCM float32
-        Returns: mel:   [B, T_mel, N_MELS]  log1p-compressed, channels-last
+        Returns: mel:   [B, T_mel, N_MELS]  log-compressed, channels-last
         """
-        mel = self.mel_transform(audio)   # [B, N_MELS, T_mel]
-        mel = mel.transpose(1, 2)         # [B, T_mel, N_MELS]
-        return torch.log1p(mel)           # log compression, avoids log(0)
+        audio_24k = self.resampler(audio)             # [B, T_24k]
+        mel = self.mel_transform(audio_24k)           # [B, N_MELS, T_mel]
+        mel = mel.transpose(1, 2)                     # [B, T_mel, N_MELS]
+        return torch.log(mel.clamp(min=1e-5))
 
     # ── Training forward pass ─────────────────────────────────────────────────
 
@@ -104,28 +107,11 @@ class VoiceConversionModel(nn.Module):
         context_mel: Tensor,    # [B, N_MELS, T_ctx]  target speaker reference mel
         target_audio: Tensor,   # [B, T_tgt]   target speaker waveform (for loss)
     ) -> tuple:
-        """
-        Returns:
-            pred_mel:   [B, T, N_MELS]  predicted mel from decoder
-            target_mel: [B, T, N_MELS]  ground-truth mel from target_audio
-            (lengths trimmed to min(T_pred, T_tgt))
-        """
-        # Encode target speaker identity
-        C = self.context_encoder(context_mel)          # [B, D_MODEL]
-
-        # Encode source content (frozen path)
-        content = self.content_encoder(source_audio)   # [B, T_frames, 769]
-
-        # Fuse content with target identity
-        fused = self.cross_attention(content, C)       # [B, T_frames, D_MODEL]
-
-        # Decode to mel
-        pred_mel = self.decoder(fused)                 # [B, T_frames*2, N_MELS]
-
-        # Ground-truth mel from target speaker audio
-        target_mel = self._compute_mel(target_audio)   # [B, T_mel, N_MELS]
-
-        # Trim to minimum length to align both mels for loss computation
+        C = self.context_encoder(context_mel)
+        content = self.content_encoder(source_audio)
+        fused = self.cross_attention(content, C)
+        pred_mel = self.decoder(fused)
+        target_mel = self._compute_mel(target_audio)
         T = min(pred_mel.shape[1], target_mel.shape[1])
         return pred_mel[:, :T, :], target_mel[:, :T, :]
 
@@ -134,9 +120,6 @@ class VoiceConversionModel(nn.Module):
     @torch.no_grad()
     def compute_context(self, reference_mels: list) -> Tensor:
         """
-        Server-side: compute and return the cached context vector C from
-        one or more reference utterances.
-
         Args:
             reference_mels: list of tensors, each [1, N_MELS, T_i]
         Returns:
@@ -148,24 +131,20 @@ class VoiceConversionModel(nn.Module):
     @torch.no_grad()
     def convert_chunk(self, audio_chunk: Tensor, C: Tensor) -> Tensor:
         """
-        Convert a single audio chunk using a pre-cached context vector.
-
         Args:
             audio_chunk: [1, T]       16 kHz PCM float32
             C:           [1, D_MODEL] pre-cached context vector
         Returns:
-            waveform:    [1, 1, T_out] converted audio float32
-                         T_out ≈ T (for T=3200: T_out = 3200)
+            waveform:    [1, 1, T_out] 24000 Hz float32
         """
         self.eval()
-        content = self.content_encoder(audio_chunk)    # [1, T_frames, 769]
-        fused = self.cross_attention(content, C)       # [1, T_frames, D_MODEL]
-        mel = self.decoder(fused)                      # [1, T_frames*2, N_MELS]
-        wav = self.vocoder(mel.transpose(1, 2))        # [1, 1, T_frames*2 * 160]
+        content = self.content_encoder(audio_chunk)
+        fused = self.cross_attention(content, C)
+        mel = self.decoder(fused)
+        wav = self.vocoder(mel.transpose(1, 2))
         return wav
 
     def get_trainable_params(self) -> list:
-        """Returns parameters from trainable modules only (for optimizer)."""
         return (
             list(self.context_encoder.parameters())
             + list(self.cross_attention.parameters())

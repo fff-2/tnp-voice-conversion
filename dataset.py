@@ -20,13 +20,15 @@ Minimum utterances per speaker: N_CTX + 2  (default: 7)
 import random
 from pathlib import Path
 
+import soundfile as sf
 import torch
 import torch.nn.functional as F
 import torchaudio
 from torch.utils.data import Dataset
 
 SAMPLE_RATE = 16_000
-N_MELS = 80
+MEL_SAMPLE_RATE = 24_000   # resample to this before computing mel (matches vocos-mel-24khz)
+N_MELS = 100
 AUDIO_EXTENSIONS = {".wav", ".flac", ".mp3", ".ogg"}
 
 
@@ -114,9 +116,10 @@ class SpeakerDataset(Dataset):
 
     def _load(self, path: Path) -> torch.Tensor:
         """Load audio file → mono float32 tensor [T] @ 16 kHz, trimmed to max_samples."""
-        wav, sr = torchaudio.load(path)
+        data, sr = sf.read(str(path), dtype="float32", always_2d=True)
+        wav = torch.from_numpy(data.T)                    # [C, T]
         if wav.shape[0] > 1:
-            wav = wav.mean(0, keepdim=True)
+            wav = wav.mean(0, keepdim=True)               # [1, T]
         if sr != SAMPLE_RATE:
             wav = torchaudio.functional.resample(wav, sr, SAMPLE_RATE)
         wav = wav.squeeze(0)                              # [T]
@@ -127,13 +130,13 @@ class SpeakerDataset(Dataset):
 
     @staticmethod
     def _mel(audio: torch.Tensor) -> torch.Tensor:
-        """[T] → [N_MELS, T_mel] log1p-compressed mel (on CPU)."""
+        """[T] → [N_MELS, T_mel] log-compressed mel at 24000 Hz (on CPU)."""
+        audio_24k = torchaudio.functional.resample(audio.unsqueeze(0), SAMPLE_RATE, MEL_SAMPLE_RATE).squeeze(0)
         transform = torchaudio.transforms.MelSpectrogram(
-            sample_rate=SAMPLE_RATE, n_fft=1024, hop_length=160,
-            win_length=1024, n_mels=N_MELS, f_min=0.0, f_max=8000.0,
-            power=1.0, norm="slaney", mel_scale="slaney",
+            sample_rate=MEL_SAMPLE_RATE, n_fft=1024, hop_length=256, win_length=1024, n_mels=N_MELS,
         )
-        return torch.log1p(transform(audio.unsqueeze(0)).squeeze(0))
+        mel = transform(audio_24k.unsqueeze(0)).squeeze(0)   # [N_MELS, T_mel]
+        return torch.log(mel.clamp(min=1e-5))
 
     # ── Dataset interface ─────────────────────────────────────────────────────
 
@@ -150,8 +153,10 @@ class SpeakerDataset(Dataset):
         tgt_files = self.speakers[tgt_spk]
         ctx_indices = [i for i in range(len(tgt_files)) if i != tgt_idx]
         ctx_indices = random.sample(ctx_indices, min(self.n_ctx, len(ctx_indices)))
+        mels = [self._mel(self._load(tgt_files[i])) for i in ctx_indices]
+        max_T = max(m.shape[-1] for m in mels)
         context_mels = torch.stack([
-            self._mel(self._load(tgt_files[i])) for i in ctx_indices
+            F.pad(m, (0, max_T - m.shape[-1])) for m in mels
         ])   # [N_CTX, N_MELS, T_ctx]
 
         return {

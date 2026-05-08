@@ -1,27 +1,28 @@
 name: voice
 channels:
-  - pytorch
-  - nvidia
   - conda-forge
   - defaults
 dependencies:
-  - python=3.10
-  - pytorch=2.4.*
-  - torchaudio=2.4.*
-  - pytorch-cuda=12.4
+  - python=3.12
   - pip
+  - portaudio
+  - ffmpeg
   - pip:
-    - deepfilternet
-    - torchcrepe
-    - fastapi>=0.110
-    - "uvicorn[standard]"
-    - websockets>=12.0
-    - librosa>=0.10
-    - soundfile
-    - sounddevice
-    - numpy
-    - scipy
-    - tqdm
-    - loguru
-    - requests
-    - python-multipart
+      # Install PyTorch separately after activating the env:
+      # pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+      - deepfilternet>=0.6.0
+      - torchcrepe
+      - fastapi>=0.110
+      - "uvicorn[standard]"
+      - websockets>=12.0
+      - librosa>=0.10
+      - soundfile
+      - sounddevice
+      - numpy>=2.0
+      - scipy
+      - tqdm
+      - loguru
+      - requests
+      - python-multipart
+      # Windows client only — install manually on Windows:
+      # pip install pipwin && pipwin install pyaudio

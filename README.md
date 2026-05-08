@@ -26,9 +26,14 @@ Few-shot, real-time voice conversion. Record a few seconds of a target speaker �
 ## Quick Start
 
 ```bash
-conda env create -f environment.yml && conda activate voice
+# 1. Create environment (Python 3.12, portaudio, ffmpeg via conda-forge)
+conda env create -f environment.yml
+conda activate voice
 
-# Download VCTK (~11 GB)
+# 2. Install PyTorch for CUDA 12.8
+pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+
+# 3. Download VCTK (~11 GB)
 wget https://datashare.ed.ac.uk/bitstream/handle/10283/3443/VCTK-Corpus-0.92.zip
 unzip VCTK-Corpus-0.92.zip -d datasets/
 
@@ -46,7 +51,7 @@ python convert.py --source me.wav --reference alice.wav --output out.wav  # offl
 
 ```
 voice/
-├── environment.yml             # Conda environment (Python 3.10, PyTorch + CUDA 12.4)
+├── environment.yml             # Conda environment (Python 3.12, PyTorch + CUDA 12.8)
 ├── datasets/                   # All datasets go here
 ├── dataset.py                  # Generic speaker-folder dataset for training
 ├── train.py                    # Training loop (AMP + gradient accumulation)
@@ -190,28 +195,32 @@ HuBERT layer-6 features are not perfectly speaker-agnostic — some identity lea
 
 ## Setup
 
-**Hardware:** NVIDIA GPU with ≥8 GB VRAM (tested on RTX 5060 Ti 16 GB) · CUDA driver ≥12.x · ≥16 GB system RAM · WSL2 Ubuntu (training) or Windows (mic client)
+**Hardware:** NVIDIA GPU with ≥8 GB VRAM (tested on RTX 5060 Ti 16 GB) · CUDA driver ≥12.8 · ≥16 GB system RAM · WSL2 Ubuntu (training) or Windows (mic client)
 
 <details>
-<summary>Conda environment setup</summary>
+<summary>Environment setup (two steps)</summary>
+
+**Step 1 — create the conda env** (Python 3.12, portaudio, ffmpeg, and all pip deps except PyTorch):
 
 ```bash
 conda env create -f environment.yml
 conda activate voice
 ```
 
-If the solver hangs, switch to libmamba first:
+**Step 2 — install PyTorch for CUDA 12.8** (must be run after activating the env):
+
+```bash
+pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+```
+
+PyTorch is not included in `environment.yml` so you can target the exact CUDA version your driver supports. Change `cu128` to match your installed CUDA if needed (e.g. `cu121` for CUDA 12.1). Check your driver's supported CUDA version with `nvidia-smi`.
+
+If the conda solver hangs, switch to libmamba first:
 
 ```bash
 conda install -n base conda-libmamba-solver
 conda config --set solver libmamba
 conda env create -f environment.yml
-```
-
-If you get a PortAudio error from `sounddevice`:
-
-```bash
-sudo apt install libportaudio2   # WSL2 / Ubuntu only
 ```
 
 </details>
@@ -222,10 +231,10 @@ sudo apt install libportaudio2   # WSL2 / Ubuntu only
 | Error | Fix |
 |---|---|
 | `CommandNotFoundError: conda activate` | `conda init bash`, then reopen terminal |
-| `PackagesNotFoundError: pytorch-cuda=12.4` | `conda config --add channels pytorch` and `--add channels nvidia` |
 | `prefix already exists: .../envs/voice` | `conda env remove -n voice` first |
-| `OSError: PortAudio library not found` | `sudo apt install libportaudio2` |
-| `torch.cuda.is_available()` returns `False` | `conda install pytorch=2.4.* pytorch-cuda=12.4 -c pytorch -c nvidia` |
+| `OSError: PortAudio library not found` | `portaudio` is in `environment.yml` — re-run `conda env create` |
+| `torch.cuda.is_available()` returns `False` | Confirm you ran Step 2 above, and that your driver supports CUDA 12.8 (`nvidia-smi` → CUDA Version row) |
+| `No module named 'torch'` | Step 2 pip install was not run, or run outside the `voice` conda env |
 
 </details>
 

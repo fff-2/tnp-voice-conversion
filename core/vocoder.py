@@ -40,5 +40,6 @@ class VocosVocoder(nn.Module):
         Returns:
             wav: [B, 1, T_wav]  waveform float32
         """
-        wav = self.model.decode(mel)   # [B, T_wav]
+        with torch.amp.autocast("cuda", enabled=False):
+            wav = self.model.decode(mel.float())   # Vocos ISTFT doesn't support FP16
         return wav.unsqueeze(1)        # [B, 1, T_wav]

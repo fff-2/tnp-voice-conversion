@@ -1,0 +1,27 @@
+name: voice
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pytorch=2.4.*
+  - torchaudio=2.4.*
+  - pytorch-cuda=12.4
+  - pip
+  - pip:
+    - deepfilternet
+    - torchcrepe
+    - fastapi>=0.110
+    - "uvicorn[standard]"
+    - websockets>=12.0
+    - librosa>=0.10
+    - soundfile
+    - sounddevice
+    - numpy
+    - scipy
+    - tqdm
+    - loguru
+    - requests
+    - python-multipart

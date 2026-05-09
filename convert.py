@@ -62,7 +62,7 @@ def convert(args) -> None:
     print("Loading model …")
     model = VoiceConversionModel(device=device)
 
-    ckpt = torch.load(args.checkpoint, map_location=device)
+    ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
     state = ckpt["model"] if "model" in ckpt else ckpt
     model.load_state_dict(state, strict=False)
     model.eval()

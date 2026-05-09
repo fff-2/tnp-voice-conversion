@@ -5,7 +5,7 @@ Trains the three trainable modules (ContextEncoder, CrossAttentionFusion, MelDec
 against frozen HuBERT content encoder and Vocos vocoder.
 
 VRAM optimizations:
-    - AMP (torch.amp.autocast + GradScaler) for FP16 forward/backward
+    - AMP (torch.amp.autocast) for bf16 forward/backward
     - Gradient accumulation (physical batch=32, accumulate=1 → effective batch=32)
 
 Dataset layout (place datasets inside the datasets/ folder):
@@ -81,8 +81,6 @@ def train(args) -> None:
         weight_decay=WEIGHT_DECAY,
         betas=(0.9, 0.98),
     )
-    scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
-
     # ── Checkpoint resume ─────────────────────────────────────────────────────
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -97,10 +95,9 @@ def train(args) -> None:
 
     ckpt_path = output_dir / "latest.pt"
     if ckpt_path.exists() and not args.reset:
-        ckpt = torch.load(ckpt_path, map_location=device)
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model"], strict=False)
         optimizer.load_state_dict(ckpt["optimizer"])
-        scaler.load_state_dict(ckpt["scaler"])
         step = ckpt["step"]
         best_loss = ckpt.get("best_loss", best_loss)
         logger.info(f"Resumed from step {step}")
@@ -164,7 +161,7 @@ def train(args) -> None:
             # Flatten context batch for context encoder
             ctx_flat = ctx_mels.view(B * N, M, T_ctx)  # [B*N, N_MELS, T_ctx]
 
-            with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=(device.type == "cuda")):
                 # ── Context encoding ──────────────────────────────────────────
                 C_all = model.context_encoder(ctx_flat)  # [B*N, D_MODEL]
                 C = C_all.view(B, N, -1).mean(dim=1)  # [B, D_MODEL]
@@ -186,7 +183,7 @@ def train(args) -> None:
                 loss = F.l1_loss(pred_mel[:, :T, :], tgt_mel[:, :T, :])
                 loss = loss / GRAD_ACCUM
 
-            scaler.scale(loss).backward()
+            loss.backward()
             running_loss += loss.item() * GRAD_ACCUM
             accum_count += 1
 
@@ -197,12 +194,10 @@ def train(args) -> None:
                 for pg in optimizer.param_groups:
                     pg["lr"] = lr
 
-                scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(
                     model.get_trainable_params(), max_norm=1.0
                 )
-                scaler.step(optimizer)
-                scaler.update()
+                optimizer.step()
                 optimizer.zero_grad()
                 step += 1
 
@@ -233,7 +228,6 @@ def train(args) -> None:
                     ckpt = {
                         "model": model.state_dict(),
                         "optimizer": optimizer.state_dict(),
-                        "scaler": scaler.state_dict(),
                         "step": step,
                         "best_loss": best_loss,
                     }
@@ -272,7 +266,7 @@ def _validate(
         B, N, M, T_ctx = ctx_mels.shape
         ctx_flat = ctx_mels.view(B * N, M, T_ctx)
 
-        with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=(device.type == "cuda")):
             C_all = model.context_encoder(ctx_flat)
             C = C_all.view(B, N, -1).mean(dim=1)
             content = model.content_encoder(target)
@@ -301,7 +295,7 @@ def _validate(
             )
 
             # Converted: source content + target speaker C → vocoder (24000 Hz out)
-            with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=(device.type == "cuda")):
                 src_content = model.content_encoder(source[0:1])
                 src_fused = model.cross_attention(src_content, C[0:1])
                 src_mel = model.decoder(src_fused)

@@ -312,7 +312,7 @@ def main() -> None:
 
     ckpt_path = Path(args.checkpoint)
     if ckpt_path.exists():
-        ckpt = torch.load(ckpt_path, map_location=device)
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
         state = ckpt["model"] if "model" in ckpt else ckpt
         model.load_state_dict(state, strict=False)
         print(f"[INIT] Checkpoint loaded: {ckpt_path}")

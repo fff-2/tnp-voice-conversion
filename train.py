@@ -19,6 +19,7 @@ Usage:
 
 import argparse
 import csv
+import math
 import sys
 from pathlib import Path
 
@@ -153,9 +154,9 @@ def train(args) -> None:
             if step >= MAX_STEPS:
                 break
 
-            source = batch["source_audio"].to(device)  # [B, T_src]
             target = batch["target_audio"].to(device)  # [B, T_tgt]
             ctx_mels = batch["context_mels"].to(device)  # [B, N_CTX, N_MELS, T_ctx]
+            target_lengths = batch["target_lengths"]     # list[int], unpadded lengths
 
             B, N, M, T_ctx = ctx_mels.shape
             # Flatten context batch for context encoder
@@ -165,24 +166,37 @@ def train(args) -> None:
                 "cuda", dtype=torch.bfloat16, enabled=(device.type == "cuda")
             ):
                 # ── Context encoding ──────────────────────────────────────────
-                C_all = model.context_encoder(ctx_flat)  # [B*N, D_MODEL]
-                C = C_all.view(B, N, -1).mean(dim=1)  # [B, D_MODEL]
+                C_all = model.context_encoder(ctx_flat)       # [B*N, T_ctx_enc, d_model]
+                T_ctx_enc = C_all.shape[1]
+                C = C_all.view(B, N, T_ctx_enc, -1).mean(dim=1)  # [B, T_ctx_enc, d_model]
 
                 # ── Content encoding (frozen, no grad) ────────────────────────
                 with torch.no_grad():
-                    content = model.content_encoder(target)  # [B, T_frames, 769]
+                    content = model.content_encoder(target)   # [B, T_frames, 769]
 
                 # ── Cross-attention + decode ──────────────────────────────────
-                fused = model.cross_attention(content, C)  # [B, T_frames, D_MODEL]
-                pred_mel = model.decoder(fused)  # [B, T_mel_pred, N_MELS]
+                fused = model.cross_attention(content, C)     # [B, T_frames, d_model]
+                pred_mel = model.decoder(fused)               # [B, T_mel_pred, N_MELS]
 
                 # ── Target mel ────────────────────────────────────────────────
                 with torch.no_grad():
-                    tgt_mel = compute_target_mel(target)  # [B, T_mel_tgt, N_MELS]
+                    tgt_mel = compute_target_mel(target)      # [B, T_mel_tgt, N_MELS]
 
-                # ── Align lengths & compute loss ──────────────────────────────
+                # ── Masked L1 loss (Fix 4: ignore padded frames) ──────────────
                 T = min(pred_mel.shape[1], tgt_mel.shape[1])
-                loss = F.l1_loss(pred_mel[:, :T, :], tgt_mel[:, :T, :])
+                mel_lengths = [
+                    1 + math.ceil(n_samples * VOCODER_SR / SAMPLE_RATE) // 256
+                    for n_samples in target_lengths
+                ]
+                mask = torch.zeros(B, T, device=device, dtype=torch.bool)
+                for i, ml in enumerate(mel_lengths):
+                    mask[i, :min(ml, T)] = True
+                loss_raw = F.l1_loss(
+                    pred_mel[:, :T, :], tgt_mel[:, :T, :], reduction="none"
+                )
+                loss = (loss_raw * mask.unsqueeze(-1)).sum() / (
+                    mask.sum() * N_MELS + 1e-8
+                )
                 loss = loss / GRAD_ACCUM
 
             loss.backward()
@@ -265,6 +279,7 @@ def _validate(
         target = batch["target_audio"].to(device)
         ctx_mels = batch["context_mels"].to(device)
 
+        target_lengths = batch["target_lengths"]
         B, N, M, T_ctx = ctx_mels.shape
         ctx_flat = ctx_mels.view(B * N, M, T_ctx)
 
@@ -272,14 +287,27 @@ def _validate(
             "cuda", dtype=torch.bfloat16, enabled=(device.type == "cuda")
         ):
             C_all = model.context_encoder(ctx_flat)
-            C = C_all.view(B, N, -1).mean(dim=1)
+            T_ctx_enc = C_all.shape[1]
+            C = C_all.view(B, N, T_ctx_enc, -1).mean(dim=1)  # [B, T_ctx_enc, d_model]
             content = model.content_encoder(target)
             fused = model.cross_attention(content, C)
             pred_mel = model.decoder(fused)
             tgt_mel = mel_transform(mel_resampler(target)).transpose(1, 2)
             tgt_mel = torch.log(tgt_mel.clamp(min=1e-5))
             T = min(pred_mel.shape[1], tgt_mel.shape[1])
-            loss = F.l1_loss(pred_mel[:, :T, :], tgt_mel[:, :T, :])
+            mel_lengths = [
+                1 + math.ceil(n_samples * VOCODER_SR / SAMPLE_RATE) // 256
+                for n_samples in target_lengths
+            ]
+            mask = torch.zeros(B, T, device=device, dtype=torch.bool)
+            for i, ml in enumerate(mel_lengths):
+                mask[i, :min(ml, T)] = True
+            loss_raw = F.l1_loss(
+                pred_mel[:, :T, :], tgt_mel[:, :T, :], reduction="none"
+            )
+            loss = (loss_raw * mask.unsqueeze(-1)).sum() / (
+                mask.sum() * N_MELS + 1e-8
+            )
 
         total_loss += loss.item()
         n += 1

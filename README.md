@@ -95,8 +95,8 @@ TARGET SPEAKER (reference audio)
         │
         ▼
 ┌─────────────────────┐
-│   Context Encoder   │  Transformer (4 layers) + Mean Pool
-│     (Trainable)     │  [B, 100, T_ctx] → C [B, 256]
+│   Context Encoder   │  Transformer (4 layers), no positional encoding
+│     (Trainable)     │  [B, 100, T_ctx] → C [B, T_ctx, 256]
 └─────────────────────┘
         │  C (computed once, cached per speaker)
         ▼
@@ -110,8 +110,8 @@ SOURCE SPEAKER (live mic / audio file)
         │
         ▼
 ┌─────────────────────┐
-│  Cross-Attention    │  Q=content, K=V=C  →  [B, T_frames, 256]
-│    (Trainable)      │
+│  Cross-Attention    │  Q=content, K=V=C sequence (TNP style)
+│    (Trainable)      │  each content frame attends over all T_ctx ref frames
 └─────────────────────┘
         │
         ▼
@@ -559,8 +559,20 @@ Feeding 16 kHz directly into DFN3 produces silent garbage with no error.
 **HuBERT layer index**
 `HUBERT_BASE.extract_features()` returns a list of 12 tensors (one per transformer layer). Index `5` (0-based) is transformer layer 6 — the correct layer for mid-level linguistic content.
 
+**F0 log scaling**
+Raw F0 from torchcrepe spans `[0, 2006]` Hz while HuBERT features are layer-normalised and fall roughly in `[-3, +3]`. The content encoder applies `torch.log1p(f0)` before concatenation, mapping F0 to `[0, ~7.6]` and preventing it from dominating the linear projection layer.
+
+**F0 decoder — argmax, not Viterbi**
+`torchcrepe` is configured with `decoder=torchcrepe.decode.argmax`. Viterbi is a global dynamic-programming algorithm that requires the full sequence and is incompatible with chunk-by-chunk streaming. Argmax is frame-independent and causal.
+
 **F0 frame alignment**
 `torchcrepe.predict(..., hop_length=320)` and HuBERT both have a 320-sample stride, producing `T // 320` frames each. If you ever change one, change both — mismatched strides cause silent feature misalignment at concatenation.
+
+**Context encoder — no positional encoding, no mean pooling**
+Speaker identity (timbre, vocal tract shape) is time-invariant. Absolute positional encoding was removed so the model cannot overfit on the temporal position of phonemes in the reference clip. Mean pooling was also removed: `ContextEncoder` now outputs a full sequence `[B, T_ctx, 256]` so `CrossAttentionFusion` can attend over all reference frames (TNP style) rather than collapsing to a single vector where softmax over one key is always 1.0.
+
+**Masked L1 loss**
+The training loss is computed only over valid (non-padded) mel frames. `collate_fn` returns `target_lengths` (original audio sample counts); the training loop converts these to mel frame counts and builds a boolean mask before calling `F.l1_loss(..., reduction="none")`. Padding regions contain `log(1e-5) ≈ −11.5` and would otherwise waste model capacity if included in the loss.
 
 **Vocos input format**
 The decoder outputs `[B, T_mel, 100]` (channels-last). Vocos expects `[B, 100, T_mel]` (channels-first). Always transpose before calling the vocoder: `vocoder(mel.transpose(1, 2))`.
@@ -571,8 +583,8 @@ HuBERT produces ~50 frames/s (stride 320 @ 16 kHz). Vocos requires ~93.75 frames
 **Gradient accumulation — scale all loss terms**
 The training loss is divided by `GRAD_ACCUM` before `.backward()`. If you add a second loss term (e.g. speaker loss), apply the same scaling: `(l1 + 0.1 * spk_loss) / GRAD_ACCUM`. Forgetting this makes the effective learning rate `GRAD_ACCUM×` too large.
 
-**FP16 NaN losses**
-Occasional NaN losses during early training are normal AMP behaviour — the GradScaler detects overflow, skips the optimizer step, and reduces the loss scale automatically. Weights are unaffected. If NaN losses persist past step ~2 000, lower `LR` or switch to `bfloat16`.
+**bfloat16 AMP — no GradScaler needed**
+Training uses `torch.bfloat16` via `torch.amp.autocast`. Unlike float16, bfloat16 has the same exponent range as float32 so activations never overflow to `inf`/`NaN`. `GradScaler` has been removed — it only exists to work around float16 underflow and is a no-op for bfloat16.
 
 </details>
 
@@ -590,9 +602,9 @@ python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_
 python - <<'EOF'
 import torch
 from core.model import VoiceConversionModel
-m   = VoiceConversionModel(torch.device("cuda"))
+m     = VoiceConversionModel(torch.device("cuda"))
 audio = torch.randn(1, 3200).cuda()
-C     = torch.randn(1, 256).cuda()
+C     = torch.randn(1, 750, 256).cuda()   # [1, T_ctx, D_MODEL] context sequence
 out   = m.convert_chunk(audio, C)
 print("Output shape:", out.shape)   # [1, 1, T_wav @ 24 kHz]
 EOF

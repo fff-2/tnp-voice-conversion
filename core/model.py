@@ -132,10 +132,10 @@ class VoiceConversionModel(nn.Module):
     def convert_chunk(self, audio_chunk: Tensor, C: Tensor) -> Tensor:
         """
         Args:
-            audio_chunk: [1, T]       16 kHz PCM float32
-            C:           [1, D_MODEL] pre-cached context vector
+            audio_chunk: [1, T]              16 kHz PCM float32
+            C:           [1, T_ctx, D_MODEL] pre-cached context sequence
         Returns:
-            waveform:    [1, 1, T_out] 24000 Hz float32
+            waveform:    [1, 1, T_out]       24000 Hz float32
         """
         self.eval()
         content = self.content_encoder(audio_chunk)

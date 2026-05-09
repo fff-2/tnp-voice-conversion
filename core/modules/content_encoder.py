@@ -138,7 +138,7 @@ class ContentEncoder(nn.Module):
             fmin=50.0,
             fmax=2006.0,
             model="tiny",                          # fast inference
-            decoder=torchcrepe.decode.viterbi,     # smooth pitch trajectory
+            decoder=torchcrepe.decode.argmax,      # Fix 3: frame-independent, causal
             return_periodicity=False,
             batch_size=None,
             device=self.device,
@@ -170,6 +170,9 @@ class ContentEncoder(nn.Module):
         hubert_feat = hubert_feat[:, :T, :]
         f0 = f0[:, :T, :]
 
-        # Step 4: concatenate
+        # Step 4: log-scale F0 then concatenate
+        # Fix 2: raw F0 spans [0, 2006] Hz vs HuBERT features in [-3, +3].
+        # log1p maps F0 to [0, ~7.6], preventing F0 from dominating the projection.
+        f0 = torch.log1p(f0)
         content = torch.cat([hubert_feat, f0], dim=-1)  # [B, T_frames, 769]
         return content

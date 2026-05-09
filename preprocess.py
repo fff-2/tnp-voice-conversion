@@ -20,9 +20,11 @@ import argparse
 import math
 from pathlib import Path
 
+import soundfile as sf
 import torch
 import torch.nn.functional as F
 import torchaudio
+import torchaudio.functional as AF
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
@@ -39,7 +41,7 @@ AUDIO_EXTENSIONS = {".wav", ".flac", ".mp3", ".ogg"}
 # ── Dataset ───────────────────────────────────────────────────────────────────
 
 class WavDataset(Dataset):
-    """Recursively finds audio files; __getitem__ only calls torchaudio.load."""
+    """Recursively finds audio files; __getitem__ reads with soundfile."""
 
     def __init__(self, root: str) -> None:
         all_files = sorted(
@@ -54,7 +56,8 @@ class WavDataset(Dataset):
 
     def __getitem__(self, idx: int):
         path = self.files[idx]
-        wav, sr = torchaudio.load(str(path))  # [C, T]
+        data, sr = sf.read(str(path), dtype="float32", always_2d=True)
+        wav = torch.from_numpy(data.T)        # [C, T]
         if wav.shape[0] > 1:
             wav = wav.mean(0, keepdim=True)   # mono [1, T]
         wav = wav.squeeze(0)                  # [T]

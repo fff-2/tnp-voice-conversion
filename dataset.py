@@ -198,6 +198,7 @@ def collate_fn(batch: list[dict]) -> dict:
         "source_audio": pad1d([b["source_audio"] for b in batch]),
         "target_audio": pad1d([b["target_audio"] for b in batch]),
         "context_mels": pad_mels([b["context_mels"] for b in batch]),
+        "source_lengths": [b["source_audio"].shape[0] for b in batch],
         "target_lengths": [b["target_audio"].shape[0] for b in batch],
         # list[B] of list[N_CTX]: unpadded mel-frame count per reference utterance.
         # Used to build key_padding_mask for cross-attention (True = padding position).

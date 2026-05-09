@@ -161,7 +161,9 @@ def train(args) -> None:
             # Flatten context batch for context encoder
             ctx_flat = ctx_mels.view(B * N, M, T_ctx)  # [B*N, N_MELS, T_ctx]
 
-            with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=(device.type == "cuda")):
+            with torch.amp.autocast(
+                "cuda", dtype=torch.bfloat16, enabled=(device.type == "cuda")
+            ):
                 # ── Context encoding ──────────────────────────────────────────
                 C_all = model.context_encoder(ctx_flat)  # [B*N, D_MODEL]
                 C = C_all.view(B, N, -1).mean(dim=1)  # [B, D_MODEL]
@@ -266,7 +268,9 @@ def _validate(
         B, N, M, T_ctx = ctx_mels.shape
         ctx_flat = ctx_mels.view(B * N, M, T_ctx)
 
-        with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=(device.type == "cuda")):
+        with torch.amp.autocast(
+            "cuda", dtype=torch.bfloat16, enabled=(device.type == "cuda")
+        ):
             C_all = model.context_encoder(ctx_flat)
             C = C_all.view(B, N, -1).mean(dim=1)
             content = model.content_encoder(target)
@@ -295,7 +299,9 @@ def _validate(
             )
 
             # Converted: source content + target speaker C → vocoder (24000 Hz out)
-            with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=(device.type == "cuda")):
+            with torch.amp.autocast(
+                "cuda", dtype=torch.bfloat16, enabled=(device.type == "cuda")
+            ):
                 src_content = model.content_encoder(source[0:1])
                 src_fused = model.cross_attention(src_content, C[0:1])
                 src_mel = model.decoder(src_fused)
@@ -326,7 +332,7 @@ def main() -> None:
         "--output-dir", default="checkpoints", help="Directory for saving checkpoints"
     )
     parser.add_argument(
-        "--num-workers", type=int, default=8, help="DataLoader worker count"
+        "--num-workers", type=int, default=12, help="DataLoader worker count"
     )
     parser.add_argument(
         "--reset",

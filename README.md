@@ -14,6 +14,7 @@ Few-shot, real-time voice conversion. Record a few seconds of a target speaker �
 - [Training Strategy](#training-strategy)
 - [Setup](#setup)
 - [Dataset — `dataset.py`](#dataset--datasetpy)
+- [Preprocessing — `preprocess.py`](#preprocessing--preprocesspy)
 - [Training — `train.py`](#training--trainpy)
 - [Real-Time Inference — `mic_convert.py`](#real-time-inference--mic_convertpy)
 - [Offline Inference — `convert.py`](#offline-inference--convertpy)
@@ -37,6 +38,9 @@ pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu12
 wget https://datashare.ed.ac.uk/bitstream/handle/10283/3443/VCTK-Corpus-0.92.zip
 unzip VCTK-Corpus-0.92.zip -d datasets/
 
+# 4. Preprocess mels on GPU (optional but recommended — eliminates CPU bottleneck)
+python preprocess.py --data-root datasets/wav48_silence_trimmed
+
 python train.py                                                    # train
 python mic_convert.py --checkpoint checkpoints/best.pt            # real-time
 python convert.py --source me.wav --reference alice.wav --output out.wav  # offline
@@ -54,6 +58,7 @@ voice/
 ├── environment.yml             # Conda environment (Python 3.12, PyTorch + CUDA 12.8)
 ├── datasets/                   # All datasets go here
 ├── dataset.py                  # Generic speaker-folder dataset for training
+├── preprocess.py               # GPU-accelerated mel preprocessing (optional, speeds up training)
 ├── train.py                    # Training loop (AMP + gradient accumulation)
 ├── convert.py                  # Offline file-to-file voice conversion
 ├── mic_convert.py              # Real-time microphone conversion (no server needed)
@@ -307,9 +312,50 @@ print(batch["context_mels"].shape)   # [B, N_CTX, 100, T_ctx]
 
 ---
 
+## Preprocessing — `preprocess.py`
+
+Computing mel spectrograms on the CPU inside the DataLoader is the primary bottleneck when training on a large dataset like VCTK (110 speakers × 400 utterances = ~44 000 files, taking over 2 hours per epoch on CPU). Running `preprocess.py` once converts every audio file to a cached `.pt` mel tensor on the GPU, reducing `dataset.py` mel loading to a simple `torch.load` call.
+
+```bash
+python preprocess.py --data-root datasets/wav48_silence_trimmed
+python preprocess.py --data-root datasets/wav48_silence_trimmed --batch-size 64  # faster on high-VRAM GPUs
+```
+
+The script is **safe to interrupt and resume** — files with an existing `.pt` are skipped automatically.
+
+**How it works:**
+
+1. Recursively finds all `.wav`/`.flac`/`.mp3`/`.ogg` files under `--data-root`
+2. Loads waveforms on the CPU with `torchaudio.load` (8 workers, pin_memory)
+3. Pads variable-length waveforms to the batch maximum
+4. Resamples to 24 kHz and applies `MelSpectrogram` on the GPU in a single batched pass
+5. Trims padding from each mel, applies `log(mel.clamp(1e-5))`, saves as `.pt` next to the source file
+
+After preprocessing, `dataset.py` automatically detects the `.pt` files and loads them instead of recomputing the mel on the fly — no flag or config change needed.
+
+<details>
+<summary>CLI flags</summary>
+
+| Flag | Default | Description |
+|---|---|---|
+| `--data-root` | *(required)* | Root directory of audio files |
+| `--batch-size` | `32` | GPU batch size — increase to fill VRAM |
+| `--num-workers` | `8` | DataLoader CPU worker count |
+
+</details>
+
+<details>
+<summary>Disk space</summary>
+
+Each `.pt` file stores a `float32` tensor of shape `[100, T_mel]`. For a typical 5-second clip at 24 kHz with hop 256: `T_mel ≈ 470` frames → `100 × 470 × 4 bytes ≈ 188 KB` per file. The full VCTK dataset adds roughly **8–10 GB** of `.pt` files alongside the original audio.
+
+</details>
+
+---
+
 ## Training — `train.py`
 
-Trains ContextEncoder, CrossAttentionFusion, and MelDecoder with FP16 AMP and gradient accumulation. ContentEncoder and Vocos remain frozen throughout.
+Trains ContextEncoder, CrossAttentionFusion, and MelDecoder with bfloat16 AMP and gradient accumulation. ContentEncoder and Vocos remain frozen throughout.
 
 ```bash
 python train.py                               # VCTK default

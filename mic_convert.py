@@ -68,6 +68,13 @@ OVERLAP_HUB_FRAMES = OVERLAP // 320   # = 4 content frames to discard after HuBE
 
 JITTER_TARGET = 5     # chunks to pre-buffer before playback starts
 
+# ── Streaming normalisation constants ─────────────────────────────────────────
+# HuBERT instance_norm collapses on 8-frame chunks (silence gives near-zero std).
+# Instead, maintain an EMA of per-channel statistics over the last ~3 seconds and
+# use that for normalization once the EMA has warmed up.
+EMA_MOMENTUM  = 0.95  # per-chunk decay; at 160 ms/chunk, τ ≈ 3 s
+STATS_WARMUP  = 15    # chunks (~2.4 s) before EMA stats replace instance_norm
+
 
 # ── Audio helpers ─────────────────────────────────────────────────────────────
 
@@ -145,6 +152,7 @@ class RealtimeConverter:
         model: VoiceConversionModel,
         C: torch.Tensor,
         device: torch.device,
+        ref_audio: torch.Tensor | None = None,
         device_in=None,
         device_out=None,
     ) -> None:
@@ -161,10 +169,125 @@ class RealtimeConverter:
         self._stop = threading.Event()
 
         self._accum = np.zeros(0, dtype=np.float32)   # mic accumulation buffer
-        # Stores the denoised tail of the previous chunk (Bug 2 fix: must be
-        # denoised audio, not raw, because it is prepended *after* DFN runs).
+        # Stores the denoised tail of the previous chunk (DFN GRU state isolation).
         self._prev_denoised = np.zeros(OVERLAP, dtype=np.float32)
         self._pre_fill_count = 0
+
+        # ── Streaming normalisation EMA state ─────────────────────────────────
+        # HuBERT channel statistics — shapes match [768] channels.
+        # Initialised to mean=0, std=1 (neutral); replaced by EMA after warmup.
+        self._hub_ema_mean = np.zeros(768, dtype=np.float32)
+        self._hub_ema_std  = np.ones(768,  dtype=np.float32)
+        # Source speaker F0 EMA (Hz, voiced frames only)
+        self._src_f0_ema_mean: float = 0.0
+        self._src_f0_ema_std:  float = 1.0
+        # Target speaker F0 stats (computed once from reference audio)
+        self.tgt_f0_mean: float = 0.0
+        self.tgt_f0_std:  float = 1.0
+        self._stats_chunks: int = 0
+
+        if ref_audio is not None:
+            self._init_speaker_stats(ref_audio)
+
+    # ── Speaker stats initialisation ──────────────────────────────────────────
+
+    def _init_speaker_stats(self, ref_audio: torch.Tensor) -> None:
+        """
+        Extract target-speaker F0 statistics from reference audio.
+        Called once at startup; sets tgt_f0_mean / tgt_f0_std for use during streaming.
+
+        Args:
+            ref_audio: [1, T]  reference waveform at SR (16 kHz) on the model's device
+        """
+        if not self.model.content_encoder._crepe_available:
+            print("[REF] torchcrepe not available — F0 shifting disabled")
+            return
+
+        with torch.no_grad():
+            f0_t = self.model.content_encoder._extract_f0(ref_audio)  # [1, T_frames, 1]
+        f0_np = f0_t[0, :, 0].cpu().numpy()   # [T_frames]
+        voiced = f0_np > 0.0
+        if voiced.sum() > 1:
+            self.tgt_f0_mean = float(f0_np[voiced].mean())
+            self.tgt_f0_std  = float(f0_np[voiced].std())
+            print(
+                f"[REF] Target F0: mean={self.tgt_f0_mean:.1f} Hz, "
+                f"std={self.tgt_f0_std:.1f} Hz"
+            )
+        else:
+            print("[REF] No voiced frames in reference — F0 shifting disabled")
+
+    # ── Per-chunk EMA update ──────────────────────────────────────────────────
+
+    def _update_stats_ema(
+        self,
+        hub_mean_t: torch.Tensor,   # [1, 768]
+        hub_std_t:  torch.Tensor,   # [1, 768]
+        f0_t:       torch.Tensor,   # [1, T_frames, 1]
+    ) -> None:
+        """Update EMA statistics from the current chunk's raw features."""
+        hub_mean_np = hub_mean_t[0].cpu().numpy()            # [768]
+        hub_std_np  = hub_std_t[0].cpu().numpy()             # [768]
+        self._hub_ema_mean = (
+            EMA_MOMENTUM * self._hub_ema_mean + (1.0 - EMA_MOMENTUM) * hub_mean_np
+        )
+        self._hub_ema_std = (
+            EMA_MOMENTUM * self._hub_ema_std  + (1.0 - EMA_MOMENTUM) * hub_std_np
+        )
+
+        f0_np = f0_t[0, :, 0].cpu().numpy()                 # [T_frames]
+        voiced = f0_np > 0.0
+        if voiced.sum() > 1:
+            chunk_f0_mean = float(f0_np[voiced].mean())
+            chunk_f0_std  = float(f0_np[voiced].std())
+            self._src_f0_ema_mean = (
+                EMA_MOMENTUM * self._src_f0_ema_mean + (1.0 - EMA_MOMENTUM) * chunk_f0_mean
+            )
+            self._src_f0_ema_std = (
+                EMA_MOMENTUM * self._src_f0_ema_std  + (1.0 - EMA_MOMENTUM) * chunk_f0_std
+            )
+
+    # ── Stats accessors for inference ─────────────────────────────────────────
+
+    def _get_inference_stats(self) -> tuple:
+        """
+        Return (hubert_stats, f0_stats) for the current chunk's normalization,
+        or (None, None) if still in warmup.
+
+        During warmup, ContentEncoder uses F.instance_norm (training behaviour).
+        After warmup, EMA-derived stats give stable normalization for short chunks.
+        """
+        if self._stats_chunks < STATS_WARMUP:
+            return None, None
+
+        hub_mean_t = (
+            torch.from_numpy(self._hub_ema_mean)
+            .float().to(self.torch_device)
+            .view(1, 1, 768)   # [1, 1, 768] — broadcasts over [B, T, 768]
+        )
+        hub_std_t = (
+            torch.from_numpy(self._hub_ema_std)
+            .float().to(self.torch_device)
+            .view(1, 1, 768)
+        )
+        hubert_stats = (hub_mean_t, hub_std_t)
+
+        # Only enable F0 shifting once both source and target stats are available
+        # and crepe is installed.
+        f0_stats = None
+        if (
+            self.model.content_encoder._crepe_available
+            and self.tgt_f0_mean > 10.0
+            and self._src_f0_ema_mean > 10.0
+        ):
+            f0_stats = (
+                self._src_f0_ema_mean,
+                max(self._src_f0_ema_std, 5.0),   # prevent near-zero std
+                self.tgt_f0_mean,
+                max(self.tgt_f0_std, 5.0),
+            )
+
+        return hubert_stats, f0_stats
 
     # ── sounddevice callback (runs in PortAudio audio thread) ─────────────────
 
@@ -245,8 +368,27 @@ class RealtimeConverter:
                     .unsqueeze(0)
                     .to(self.torch_device)
                 )                                             # [1, 3840]
+
+                # ── Streaming normalisation stats update ─────────────────────
+                # extract_streaming_stats runs HuBERT and F0 once to get raw
+                # channel statistics for EMA tracking. These same models also run
+                # inside convert_chunk_streaming below. The small extra cost
+                # (~5 ms) is accepted to keep EMA logic outside the model.
+                hub_mean_t, hub_std_t, raw_f0_t = (
+                    self.model.content_encoder.extract_streaming_stats(audio_t)
+                )
+                self._update_stats_ema(hub_mean_t, hub_std_t, raw_f0_t)
+                self._stats_chunks += 1
+
+                # Use EMA stats from previous chunks for THIS chunk's normalization
+                # (None during warmup → falls back to per-chunk F.instance_norm).
+                hubert_stats, f0_stats = self._get_inference_stats()
+
                 wav = self.model.convert_chunk_streaming(
-                    audio_t, self.C, overlap_frames=OVERLAP_HUB_FRAMES
+                    audio_t, self.C,
+                    overlap_frames=OVERLAP_HUB_FRAMES,
+                    hubert_stats=hubert_stats,
+                    f0_stats=f0_stats,
                 )                                             # [1, 1, T_out @ 24000 Hz]
 
                 # Resample 24 kHz → 16 kHz.
@@ -379,6 +521,7 @@ def main() -> None:
         model=model,
         C=C,
         device=device,
+        ref_audio=ref_audio,
         device_in=args.device_in,
         device_out=args.device_out,
     )

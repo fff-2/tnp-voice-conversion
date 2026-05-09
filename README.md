@@ -557,8 +557,16 @@ In streaming mode the DFN GRU must only advance over **new** audio. `mic_convert
 **HuBERT layer index**
 `HUBERT_BASE.extract_features()` returns a list of 12 tensors (one per transformer layer). Index `5` (0-based) is transformer layer 6 — the correct layer for mid-level linguistic content.
 
-**F0 log scaling**
-Raw F0 from torchcrepe spans `[0, 2006]` Hz while HuBERT features are layer-normalised and fall roughly in `[-3, +3]`. The content encoder applies `torch.log1p(f0)` before concatenation, mapping F0 to `[0, ~7.6]` and preventing it from dominating the linear projection layer.
+**F0 log scaling and cross-speaker Z-score shift**
+Raw F0 from torchcrepe spans `[0, 2006]` Hz while HuBERT features fall roughly in `[-3, +3]`. `torch.log1p(f0)` maps F0 to `[0, ~7.6]`, preventing it from dominating the linear projection.
+
+For cross-gender or wide-pitch-range conversion, `ContentEncoder.forward()` accepts an optional `f0_stats=(src_mean, src_std, tgt_mean, tgt_std)` tuple. When provided, voiced frames (f0 > 0) are Z-score shifted before `log1p`:
+```python
+voiced_mask = (f0 > 0.0).float()
+f0_shifted = (f0 - src_mean) / (src_std + 1e-5) * tgt_std + tgt_mean
+f0 = voiced_mask * f0_shifted.clamp(min=0.0) + (1.0 - voiced_mask) * f0
+```
+Unvoiced frames (f0 == 0) are left unchanged. This shifts the source speaker's pitch contour into the target speaker's fundamental frequency range — without it, a male-to-female conversion will have the correct timbre but the wrong pitch register. In `mic_convert.py`, target stats are extracted from the reference audio at startup; source stats are tracked via EMA over the streaming session and only applied after `STATS_WARMUP=15` chunks.
 
 **F0 decoder — argmax, not Viterbi**
 `torchcrepe` is configured with `decoder=torchcrepe.decode.argmax`. Viterbi is a global dynamic-programming algorithm that requires the full sequence and is incompatible with chunk-by-chunk streaming. Argmax is frame-independent and causal.
@@ -593,13 +601,16 @@ The training loss is divided by `GRAD_ACCUM` before `.backward()`. If you add a 
 **bfloat16 AMP — no GradScaler needed**
 Training uses `torch.bfloat16` via `torch.amp.autocast`. Unlike float16, bfloat16 has the same exponent range as float32 so activations never overflow to `inf`/`NaN`. `GradScaler` has been removed — it only exists to work around float16 underflow and is a no-op for bfloat16.
 
-**HuBERT Instance Normalization — anti-copy-synthesis**
-`F.instance_norm` is applied to the HuBERT features `[B, 768, T_frames]` before they are concatenated with F0. Instance norm normalises each `(sample, channel)` pair independently across the time axis, removing any per-sample mean/variance that would carry speaker-specific spectral cues through the content path. Because this is a deterministic, parameter-free operation, it adds no trainable parameters and costs negligible compute.
+**HuBERT normalization — training vs streaming**
+HuBERT features must be normalised per-channel to strip residual speaker timbre. The mechanism differs between training and streaming:
+
+*Training* — `F.instance_norm` over the full sequence: normalises each `(sample, channel)` pair across all T frames, giving mean=0 / std=1 per channel. Stable because sequences are 100–400 frames long.
+
+*Streaming* — only 8 frames per chunk. Computing `F.instance_norm` on 8 frames is catastrophic: during silence the denominator is near-zero and the output explodes; even during speech the statistics are wildly noisy frame-to-frame. Instead, `ContentEncoder.forward()` accepts `hubert_stats=(mean, std)` as `[1, 1, 768]` tensors:
 ```python
-# content_encoder.py — forward()
-hubert_norm = F.instance_norm(hubert_feat.transpose(1, 2)).transpose(1, 2)
-content = torch.cat([hubert_norm, f0], dim=-1)   # [B, T_frames, 769]
+hubert_norm = (hubert_feat - hub_mean) / (hub_std + 1e-5)
 ```
+`mic_convert.py` maintains a per-channel EMA (`momentum=0.95`, τ ≈ 3 s) of the raw HuBERT channel statistics, updated each chunk via `content_encoder.extract_streaming_stats()`. The EMA stats are passed into `convert_chunk_streaming()` → `content_encoder.forward()` after a `STATS_WARMUP=15` chunk (~2.4 s) period, during which the pipeline falls back to per-chunk `instance_norm`.
 
 **TNP training / inference consistency**
 At inference `encode_references()` **concatenates** N reference sequences along the time axis: `torch.cat(encoded, dim=1)` → `[1, N·T_ctx, 256]`. The training loop must mirror this exactly. The old code averaged with `.mean(dim=1)` which mixed frames from completely different utterances and broke the TNP contract.
@@ -609,19 +620,28 @@ The correct reshape is:
 C = C_all.view(B, N * T_ctx_enc, -1)   # [B, N·T_ctx, d_model]  ← concatenate, not mean
 ```
 
-**Context key_padding_mask — exclude padded reference frames**
-Context mels are zero-padded in two places: within `__getitem__` (different mels padded to the item-level maximum T) and in `collate_fn` (items padded to the batch-level maximum T). These zero regions — `F.pad` fills with `0.0`, not a valid log-mel value — must not participate in cross-attention softmax.
+**Two separate padding masks for context — self-attention and cross-attention**
+Context mels are zero-padded in two places: within `__getitem__` (different mels padded to the item-level maximum T) and in `collate_fn` (items padded to the batch-level maximum T). Padding must be excluded from *both* the context encoder's self-attention and the cross-attention fusion. These require masks of different shapes and must be built separately.
 
-`dataset.py` records the unpadded length of every reference mel as `ctx_mel_lens: list[N_CTX]` per item. `collate_fn` aggregates it into `ctx_mel_lens: list[B][N_CTX]`. The training loop builds a boolean mask:
+`dataset.py` records the unpadded length of every reference mel as `ctx_mel_lens: list[N_CTX]` per item. `collate_fn` aggregates it into `ctx_mel_lens: list[B][N_CTX]`. The training loop builds both masks:
 ```python
-# True = padding position (ignored by MultiheadAttention)
+# ── 1. Context encoder self-attention mask — shape [B*N, T_ctx] ──────────────
+# ctx_flat is [B*N, N_MELS, T_ctx]: flat index i*N+n = reference n of item i.
+ctx_enc_mask = torch.ones(B * N, T_ctx, dtype=torch.bool, device=device)
+for i in range(B):
+    for n in range(N):
+        ctx_enc_mask[i * N + n, :ctx_mel_lens[i][n]] = False
+C_all = model.context_encoder(ctx_flat, src_key_padding_mask=ctx_enc_mask)
+
+# ── 2. Cross-attention key_padding_mask — shape [B, N*T_ctx] ─────────────────
+# C is [B, N*T_ctx, d_model]: N reference sequences concatenated along time.
 ctx_mask = torch.ones(B, N * T_ctx_enc, dtype=torch.bool, device=device)
 for i in range(B):
     for n in range(N):
         ctx_mask[i, n * T_ctx_enc : n * T_ctx_enc + ctx_mel_lens[i][n]] = False
 model.cross_attention(content, C, key_padding_mask=ctx_mask)
 ```
-At inference, `encode_references()` processes one utterance at a time so there is no padding; `ctx_mask` is `None` (the default).
+Without the self-attention mask, zero-padded frames in the context encoder corrupt the speaker embeddings before they even reach cross-attention. At inference, `encode_references()` processes one utterance at a time — no padding, both masks are `None`.
 
 </details>
 

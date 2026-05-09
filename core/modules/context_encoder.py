@@ -39,16 +39,17 @@ class ContextEncoder(nn.Module):
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         self.out_norm = nn.LayerNorm(d_model)
 
-    def forward(self, mel: Tensor) -> Tensor:
+    def forward(self, mel: Tensor, src_key_padding_mask: Tensor | None = None) -> Tensor:
         """
         Args:
-            mel: [B, n_mels, T_ctx]  channels-first (torchaudio convention)
+            mel:                  [B, n_mels, T_ctx]  channels-first
+            src_key_padding_mask: [B, T_ctx]  bool, True = padded position (optional)
         Returns:
             C:   [B, T_ctx, d_model]  sequence of context representations
         """
         x = mel.permute(0, 2, 1)       # [B, T_ctx, n_mels]
         x = self.input_proj(x)         # [B, T_ctx, d_model]
-        x = self.encoder(x)            # [B, T_ctx, d_model]
+        x = self.encoder(x, src_key_padding_mask=src_key_padding_mask)  # [B, T_ctx, d_model]
         x = self.out_norm(x)           # [B, T_ctx, d_model]
         return x                       # no mean pool — full sequence for cross-attention
 

@@ -158,6 +158,8 @@ class VoiceConversionModel(nn.Module):
         C: Tensor,
         overlap_frames: int = 0,
         ctx_mask: Tensor | None = None,
+        hubert_stats: tuple | None = None,
+        f0_stats: tuple | None = None,
     ) -> Tensor:
         """
         Streaming variant of convert_chunk for real-time mic conversion.
@@ -181,12 +183,21 @@ class VoiceConversionModel(nn.Module):
             C:                 [1, T_ctx, D_MODEL]  pre-cached speaker context
             overlap_frames:    HuBERT frames at the front of content to discard
             ctx_mask:          optional padding mask for C
+            hubert_stats:      (mean, std) each [1, 1, 768] — EMA stats for stable
+                               streaming normalization; replaces per-chunk instance_norm
+            f0_stats:          (src_mean, src_std, tgt_mean, tgt_std) floats — shifts
+                               voiced F0 from source to target speaker range
         Returns:
             waveform: [1, 1, T_out]  24000 Hz float32
         """
         self.eval()
-        # skip_denoise=True because the caller ran DFN on the clean chunk already
-        content = self.content_encoder(predenoised_audio, skip_denoise=True)
+        # skip_denoise=True: caller ran DFN on the clean chunk only (GRU state isolation)
+        content = self.content_encoder(
+            predenoised_audio,
+            skip_denoise=True,
+            hubert_stats=hubert_stats,
+            f0_stats=f0_stats,
+        )
         if overlap_frames > 0:
             content = content[:, overlap_frames:, :]
         fused = self.cross_attention(content, C, key_padding_mask=ctx_mask)

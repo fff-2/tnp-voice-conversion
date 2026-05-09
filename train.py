@@ -167,13 +167,24 @@ def train(args) -> None:
                 "cuda", dtype=torch.bfloat16, enabled=(device.type == "cuda")
             ):
                 # ── Context encoding ──────────────────────────────────────────
-                C_all = model.context_encoder(ctx_flat)  # [B*N, T_ctx, d_model]
+                # Self-attention padding mask for the context encoder Transformer.
+                # Shape [B*N, T_ctx]: flat index i*N+n covers reference mel n of
+                # batch item i; positions beyond ctx_mel_lens[i][n] are zero-padding.
+                ctx_enc_mask = torch.ones(B * N, T_ctx, dtype=torch.bool, device=device)
+                for i in range(B):
+                    for n in range(N):
+                        valid = ctx_mel_lens[i][n]
+                        ctx_enc_mask[i * N + n, :valid] = False
+
+                C_all = model.context_encoder(
+                    ctx_flat, src_key_padding_mask=ctx_enc_mask
+                )                                        # [B*N, T_ctx, d_model]
                 T_ctx_enc = C_all.shape[1]               # == T_ctx (no temporal stride)
                 # Concatenate N reference sequences along the time axis (TNP style),
                 # matching encode_references() used at inference.
                 C = C_all.view(B, N * T_ctx_enc, -1)     # [B, N*T_ctx, d_model]
 
-                # ── Context padding mask ──────────────────────────────────────
+                # ── Cross-attention padding mask ──────────────────────────────
                 # True = position is zero-padding; prevents it from polluting attention.
                 # Each item i has N mels; mel n occupies positions [n*T_ctx_enc, (n+1)*T_ctx_enc).
                 # Valid frames = ctx_mel_lens[i][n]; remainder is zero-padding.
@@ -302,7 +313,15 @@ def _validate(
         with torch.amp.autocast(
             "cuda", dtype=torch.bfloat16, enabled=(device.type == "cuda")
         ):
-            C_all = model.context_encoder(ctx_flat)   # [B*N, T_ctx, d_model]
+            ctx_enc_mask = torch.ones(B * N, T_ctx, dtype=torch.bool, device=device)
+            for i in range(B):
+                for n in range(N):
+                    valid = ctx_mel_lens[i][n]
+                    ctx_enc_mask[i * N + n, :valid] = False
+
+            C_all = model.context_encoder(
+                ctx_flat, src_key_padding_mask=ctx_enc_mask
+            )                                          # [B*N, T_ctx, d_model]
             T_ctx_enc = C_all.shape[1]
             C = C_all.view(B, N * T_ctx_enc, -1)      # [B, N*T_ctx, d_model]
 

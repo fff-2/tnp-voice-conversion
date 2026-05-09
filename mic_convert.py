@@ -50,8 +50,22 @@ SR = 16_000
 VOCODER_SR = 24_000   # vocos output sample rate; output is resampled back to SR for playback
 N_MELS = 100
 CHUNK = 1024          # samples per audio callback frame  (~64 ms)
-PROC_SAMPLES = 3200   # accumulated before each inference (~200 ms)
-OVERLAP = 1600        # left-context fed to DFN/HuBERT to reduce edge artefacts
+
+# Bug 1 fix — choose PROC_SAMPLES so the full pipeline produces an exact integer
+# number of output samples with no accumulating drift:
+#   2560 / HOP=320 = 8 HuBERT frames
+#   8 × upsample=1.875 = 15 Vocos mel frames  (exact integer — no floor rounding)
+#   15 × hop_length=256 = 3840 samples @ 24 kHz
+#   3840 × (16 000 / 24 000) = 2560 samples @ 16 kHz  ← equals PROC_SAMPLES ✓
+PROC_SAMPLES = 2560
+
+# OVERLAP is kept for HuBERT edge quality (left-context reduces boundary artefacts),
+# but DFN now only sees the non-overlapping chunk (see Bug 2 fix below).
+#   1280 / HOP=320 = 4 HuBERT frames — trimmed from content before the decoder so
+#   the decoder always receives exactly 8 new frames regardless of overlap size.
+OVERLAP = 1280
+OVERLAP_HUB_FRAMES = OVERLAP // 320   # = 4 content frames to discard after HuBERT
+
 JITTER_TARGET = 5     # chunks to pre-buffer before playback starts
 
 
@@ -147,7 +161,9 @@ class RealtimeConverter:
         self._stop = threading.Event()
 
         self._accum = np.zeros(0, dtype=np.float32)   # mic accumulation buffer
-        self._prev_ctx = np.zeros(OVERLAP, dtype=np.float32)  # DFN left-context
+        # Stores the denoised tail of the previous chunk (Bug 2 fix: must be
+        # denoised audio, not raw, because it is prepended *after* DFN runs).
+        self._prev_denoised = np.zeros(OVERLAP, dtype=np.float32)
         self._pre_fill_count = 0
 
     # ── sounddevice callback (runs in PortAudio audio thread) ─────────────────
@@ -196,30 +212,54 @@ class RealtimeConverter:
                 chunk = self._accum[:PROC_SAMPLES]
                 self._accum = self._accum[PROC_SAMPLES:]
 
-                # Prepend left-context for DFN GRU continuity + HuBERT edge quality
-                with_ctx = np.concatenate([self._prev_ctx, chunk])
-                self._prev_ctx = chunk[-OVERLAP:].copy()
-
-                # GPU inference
-                audio_t = (
-                    torch.from_numpy(with_ctx)
+                # ── Bug 2 fix: DFN GRU state isolation ──────────────────────
+                # DFN contains a stateful GRU.  Feeding the overlap prefix (raw
+                # audio that was already processed last iteration) would advance
+                # the GRU twice over the same timeline, destroying its temporal
+                # continuity and producing robotic noise.
+                # Solution: run DFN on the pure new chunk only, then prepend
+                # the *denoised* overlap for HuBERT edge quality.
+                chunk_t = (
+                    torch.from_numpy(chunk)
                     .unsqueeze(0)
                     .to(self.torch_device)
-                )                                           # [1, PROC+OVERLAP]
-                wav = self.model.convert_chunk(audio_t, self.C)   # [1, 1, T_out @ 24000 Hz]
+                )                                             # [1, 2560]
+                with torch.no_grad():
+                    denoised_t = self.model.content_encoder._denoise(chunk_t)  # [1, 2560]
+                denoised_np = denoised_t.squeeze(0).cpu().numpy()
 
-                # Resample vocoder output (24000 Hz) → playback rate (16000 Hz)
-                wav_16k = AF.resample(wav.squeeze(0), VOCODER_SR, SR)   # [1, T_16k]
+                # Prepend stored denoised overlap for HuBERT left-context.
+                denoised_full = np.concatenate(
+                    [self._prev_denoised, denoised_np]
+                )                                             # 1280 + 2560 = 3840 samples
+                self._prev_denoised = denoised_np[-OVERLAP:].copy()
+
+                # ── Bug 1 fix: exact integer pipeline ────────────────────────
+                # Pass the full 3840 samples to HuBERT (overlap gives edge context),
+                # then trim OVERLAP_HUB_FRAMES=4 from the front of the content tensor
+                # inside convert_chunk_streaming so the decoder sees exactly 8 frames:
+                #   8 frames × 1.875 upsample = 15 mel frames  (exact, no floor loss)
+                #   15 × hop=256 = 3840 @ 24 kHz → ×(16/24) = 2560 @ 16 kHz = PROC_SAMPLES
+                audio_t = (
+                    torch.from_numpy(denoised_full)
+                    .unsqueeze(0)
+                    .to(self.torch_device)
+                )                                             # [1, 3840]
+                wav = self.model.convert_chunk_streaming(
+                    audio_t, self.C, overlap_frames=OVERLAP_HUB_FRAMES
+                )                                             # [1, 1, T_out @ 24000 Hz]
+
+                # Resample 24 kHz → 16 kHz.
+                # Ratio is exactly 2/3; 3840 × (2/3) = 2560 — no fractional samples.
+                wav_16k = AF.resample(wav.squeeze(0), VOCODER_SR, SR)  # [1, 2560]
                 out_np = wav_16k.squeeze().cpu().numpy().astype(np.float32)
                 np.clip(out_np, -1.0, 1.0, out=out_np)
 
-                # Discard the context prefix from the output
-                trim = int(len(out_np) * PROC_SAMPLES / (PROC_SAMPLES + OVERLAP))
-                out_trimmed = out_np[-trim:]
+                # No ratio-trim needed: output is exactly PROC_SAMPLES (2560) long.
 
                 # Split into CHUNK-sized slices and push to jitter buffer
-                for i in range(0, len(out_trimmed), CHUNK):
-                    self.out_deque.append(out_trimmed[i: i + CHUNK])
+                for i in range(0, len(out_np), CHUNK):
+                    self.out_deque.append(out_np[i: i + CHUNK])
 
                 self._pre_fill_count += 1
                 if self._pre_fill_count >= JITTER_TARGET and not self._ready.is_set():

@@ -459,19 +459,17 @@ Press `Ctrl+C` to stop.
 
 ```
 Microphone  →  mic_queue  →  Inference thread  →  Jitter buffer  →  Speaker
-[1024 samples/callback]   [accumulate 3200]   [5-chunk pre-fill]
+[1024 samples/callback]   [accumulate 2560]   [5-chunk pre-fill]
 ```
 
 | Stage | Time |
 |---|---|
-| Mic accumulation (3 200 samples) | ~200 ms |
+| Mic accumulation (2 560 samples) | ~160 ms |
 | GPU inference (DFN3 + HuBERT + decode + vocoder) | ~25 ms |
-| Jitter buffer pre-fill (5 chunks) | ~320 ms |
-| **Total steady-state** | **~250 ms** |
+| Jitter buffer pre-fill (5 chunks) | ~256 ms |
+| **Total steady-state** | **~210 ms** |
 
-To reduce latency, lower `PROC_SAMPLES` in `mic_convert.py` (e.g. `1600` = 100 ms) at the cost of slightly worse chunk-boundary quality.
-
-Vocos outputs at 24 kHz; the processing thread resamples back to 16 kHz for playback so you can use a standard 16 kHz output device.
+`PROC_SAMPLES` must be a multiple of **2 560** to avoid fractional Vocos mel frames (see *Streaming chunk size constraint* in Implementation Notes). Vocos outputs at 24 kHz; the processing thread resamples back to 16 kHz for playback so you can use a standard 16 kHz output device.
 
 </details>
 
@@ -554,6 +552,8 @@ Feeding 16 kHz directly into DFN3 produces silent garbage with no error.
 **DeepFilterNet3 GRU state**
 `reset_dfn_state()` must be called **once per audio session** — when a WebSocket connection opens or when `mic_convert.py` starts. Do not call it between chunks; the GRU hidden state carries temporal context across chunks.
 
+In streaming mode the DFN GRU must only advance over **new** audio. `mic_convert.py` calls `content_encoder._denoise()` on the raw non-overlapping chunk before prepending the denoised overlap for HuBERT context. Feeding the overlap prefix into DFN would process the same timeline twice, destroying the GRU state. The dedicated `VoiceConversionModel.convert_chunk_streaming()` method accepts pre-denoised audio and takes `skip_denoise=True` through to `ContentEncoder.forward()` so DFN is never called twice.
+
 **HuBERT layer index**
 `HUBERT_BASE.extract_features()` returns a list of 12 tensors (one per transformer layer). Index `5` (0-based) is transformer layer 6 — the correct layer for mid-level linguistic content.
 
@@ -577,6 +577,15 @@ The decoder outputs `[B, T_mel, 100]` (channels-last). Vocos expects `[B, 100, T
 
 **Mel decoder upsample factor**
 HuBERT produces ~50 frames/s (stride 320 @ 16 kHz). Vocos requires ~93.75 frames/s (24 000 Hz / hop 256). The decoder uses `scale_factor = 24000 / (256 × 50) = 1.875` to bridge this gap.
+
+**Streaming chunk size constraint**
+`nn.Upsample(scale_factor=1.875)` floors its output size. For N HuBERT frames, the Vocos input has `floor(N × 1.875)` mel frames, which is only an integer when `N` is a multiple of 8 (since 1.875 = 15/8). The streaming constants are chosen so that:
+```
+PROC_SAMPLES = 2560 → 2560 / 320 = 8 HuBERT frames
+8 × 1.875 = 15 Vocos mel frames  (exact — no floor loss)
+15 × hop 256 = 3840 @ 24 kHz  →  × (16/24) = 2560 @ 16 kHz = PROC_SAMPLES ✓
+```
+The 1 280-sample HuBERT overlap is trimmed at the **content tensor** level (4 frames discarded before the decoder), so the decoder always sees exactly 8 frames regardless of overlap size. Do not set `PROC_SAMPLES` to a value where `PROC_SAMPLES / 320` is not a multiple of 8 — it will cause a fractional mel frame count, floor rounding, and a permanent per-chunk sample deficit that accumulates as audio drift.
 
 **Gradient accumulation — scale all loss terms**
 The training loss is divided by `GRAD_ACCUM` before `.backward()`. If you add a second loss term (e.g. speaker loss), apply the same scaling: `(l1 + 0.1 * spk_loss) / GRAD_ACCUM`. Forgetting this makes the effective learning rate `GRAD_ACCUM×` too large.

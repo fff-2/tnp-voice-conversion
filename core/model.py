@@ -151,6 +151,49 @@ class VoiceConversionModel(nn.Module):
         wav = self.vocoder(mel.transpose(1, 2))
         return wav
 
+    @torch.no_grad()
+    def convert_chunk_streaming(
+        self,
+        predenoised_audio: Tensor,
+        C: Tensor,
+        overlap_frames: int = 0,
+        ctx_mask: Tensor | None = None,
+    ) -> Tensor:
+        """
+        Streaming variant of convert_chunk for real-time mic conversion.
+
+        The caller must run content_encoder._denoise() on the raw non-overlapping
+        chunk *before* calling this method, then prepend the stored denoised
+        overlap prefix. This ensures the DFN GRU only advances over new audio and
+        never re-processes past samples.
+
+        overlap_frames content frames are discarded from the front of the HuBERT
+        output so the decoder receives only the new-chunk frames, keeping the
+        output length deterministic and aligned with PROC_SAMPLES:
+
+            PROC_SAMPLES=2560 / HOP=320 = 8 HuBERT frames
+            8 frames × 1.875 upsample = 15 Vocos mel frames  (exact integer)
+            15 × hop_length=256 = 3840 samples @ 24 kHz
+            3840 × (16000/24000) = 2560 samples @ 16 kHz  ← equals PROC_SAMPLES
+
+        Args:
+            predenoised_audio: [1, T]  denoised audio with overlap prefix prepended
+            C:                 [1, T_ctx, D_MODEL]  pre-cached speaker context
+            overlap_frames:    HuBERT frames at the front of content to discard
+            ctx_mask:          optional padding mask for C
+        Returns:
+            waveform: [1, 1, T_out]  24000 Hz float32
+        """
+        self.eval()
+        # skip_denoise=True because the caller ran DFN on the clean chunk already
+        content = self.content_encoder(predenoised_audio, skip_denoise=True)
+        if overlap_frames > 0:
+            content = content[:, overlap_frames:, :]
+        fused = self.cross_attention(content, C, key_padding_mask=ctx_mask)
+        mel = self.decoder(fused)
+        wav = self.vocoder(mel.transpose(1, 2))
+        return wav
+
     def get_trainable_params(self) -> list:
         return (
             list(self.context_encoder.parameters())

@@ -148,17 +148,24 @@ class ContentEncoder(nn.Module):
         pitch = torch.nan_to_num(pitch, nan=0.0)   # 0.0 for unvoiced frames
         return pitch.unsqueeze(-1)                 # [B, T_frames, 1]
 
-    def forward(self, audio_16k: Tensor) -> Tensor:
+    def forward(self, audio_16k: Tensor, skip_denoise: bool = False) -> Tensor:
         """
         Full content encoding pipeline.
 
         Args:
-            audio_16k: [B, T]  raw PCM float32 at 16 kHz
+            audio_16k:    [B, T]  raw PCM float32 at 16 kHz
+            skip_denoise: if True, bypass DFN and use audio_16k directly.
+                          Used in streaming when the caller has already run
+                          _denoise() on the non-overlapping chunk to keep the
+                          GRU state clean.
         Returns:
             content:   [B, T_frames, 769]  HuBERT(768) ‖ F0(1)
         """
-        # Step 1: denoise
-        audio = self._denoise(audio_16k)           # [B, T]
+        # Step 1: denoise (skipped in streaming mode — caller owns DFN state)
+        if skip_denoise:
+            audio = audio_16k
+        else:
+            audio = self._denoise(audio_16k)       # [B, T]
 
         # Step 2: HuBERT features
         hubert_feat = self._extract_hubert(audio)  # [B, T_frames, 768]

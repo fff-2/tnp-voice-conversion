@@ -129,17 +129,8 @@ class SpeakerDataset(Dataset):
         return wav
 
     @staticmethod
-    def _mel(audio: torch.Tensor, wav_path: Path | None = None) -> torch.Tensor:
-        """[T] → [N_MELS, T_mel] log-compressed mel at 24000 Hz (on CPU).
-
-        Loads from a precomputed .pt cache written by preprocess.py when
-        available; falls back to on-the-fly computation otherwise.
-        """
-        if wav_path is not None:
-            cache = wav_path.with_suffix(".pt")
-            if cache.exists():
-                return torch.load(cache, weights_only=True)
-
+    def _mel(audio: torch.Tensor) -> torch.Tensor:
+        """[T] → [N_MELS, T_mel] log-compressed mel at 24000 Hz (on CPU)."""
         audio_24k = torchaudio.functional.resample(audio.unsqueeze(0), SAMPLE_RATE, MEL_SAMPLE_RATE).squeeze(0)
         transform = torchaudio.transforms.MelSpectrogram(
             sample_rate=MEL_SAMPLE_RATE, n_fft=1024, hop_length=256, win_length=1024, n_mels=N_MELS,
@@ -162,7 +153,12 @@ class SpeakerDataset(Dataset):
         tgt_files = self.speakers[tgt_spk]
         ctx_indices = [i for i in range(len(tgt_files)) if i != tgt_idx]
         ctx_indices = random.sample(ctx_indices, min(self.n_ctx, len(ctx_indices)))
-        mels = [self._mel(self._load(tgt_files[i]), tgt_files[i]) for i in ctx_indices]
+        mels = [
+            torch.load(tgt_files[i].with_suffix(".pt"), weights_only=True)
+            if tgt_files[i].with_suffix(".pt").exists()
+            else self._mel(self._load(tgt_files[i]))
+            for i in ctx_indices
+        ]
         max_T = max(m.shape[-1] for m in mels)
         context_mels = torch.stack([
             F.pad(m, (0, max_T - m.shape[-1])) for m in mels

@@ -6,7 +6,7 @@ against frozen HuBERT content encoder and Vocos vocoder.
 
 VRAM optimizations:
     - AMP (torch.amp.autocast) for bf16 forward/backward
-    - Gradient accumulation (physical batch=32, accumulate=1 → effective batch=32)
+    - Gradient accumulation (physical batch=40, accumulate=2 → effective batch=80)
 
 Dataset layout (place datasets inside the datasets/ folder):
     VCTK:       datasets/wav48_silence_trimmed/
@@ -205,7 +205,7 @@ def train(args) -> None:
 
                 # ── Logging ───────────────────────────────────────────────────
                 if step % LOG_EVERY == 0:
-                    avg = running_loss / LOG_EVERY
+                    avg = running_loss / (LOG_EVERY * GRAD_ACCUM)
                     running_loss = 0.0
                     logger.info(f"step={step:6d}  loss={avg:.4f}  lr={lr:.2e}")
 

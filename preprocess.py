@@ -24,7 +24,6 @@ import soundfile as sf
 import torch
 import torch.nn.functional as F
 import torchaudio
-import torchaudio.functional as AF
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
@@ -150,7 +149,7 @@ def main() -> None:
                 # With center=True (torchaudio default): frames = 1 + T_24k // hop
                 t_24k = math.ceil(orig_len * MEL_SR / native_sr)
                 t_mel = 1 + t_24k // HOP
-                mel = mel[:, :t_mel]   # [N_MELS, t_mel]
+                mel = mel[:, :t_mel].clone()   # clone breaks view into padded batch storage
 
                 out_path = Path(path).with_suffix(".pt")
                 torch.save(mel, out_path)

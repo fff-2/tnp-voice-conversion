@@ -37,7 +37,8 @@ CHUNK_SAMPLES = 16_000 * 4   # process 4-second chunks (content encoder at 16 kH
 
 def load_audio(path: str, device: torch.device) -> torch.Tensor:
     """Load any audio file → mono float32 [1, T] @ 16 kHz on device."""
-    wav, sr = torchaudio.load(path)
+    data, sr = sf.read(str(path), dtype="float32", always_2d=True)
+    wav = torch.from_numpy(data.T)           # [C, T]
     if wav.shape[0] > 1:
         wav = wav.mean(0, keepdim=True)      # [1, T]
     if sr != SAMPLE_RATE:

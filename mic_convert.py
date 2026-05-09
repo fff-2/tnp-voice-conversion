@@ -29,6 +29,7 @@ from collections import deque
 from pathlib import Path
 
 import numpy as np
+import soundfile as sf
 import torch
 import torchaudio
 import torchaudio.functional as AF
@@ -113,7 +114,8 @@ def record_reference(seconds: int, device_in=None) -> np.ndarray:
 
 def load_wav_reference(path: str, device: torch.device) -> torch.Tensor:
     """Load a WAV file → mono float32 tensor [1, T] @ SR on device."""
-    wav, sr = torchaudio.load(path)
+    data, sr = sf.read(str(path), dtype="float32", always_2d=True)
+    wav = torch.from_numpy(data.T)           # [C, T]
     if wav.shape[0] > 1:
         wav = wav.mean(0, keepdim=True)
     if sr != SR:

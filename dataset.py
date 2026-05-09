@@ -153,12 +153,19 @@ class SpeakerDataset(Dataset):
         tgt_files = self.speakers[tgt_spk]
         ctx_indices = [i for i in range(len(tgt_files)) if i != tgt_idx]
         ctx_indices = random.sample(ctx_indices, min(self.n_ctx, len(ctx_indices)))
-        mels = [
-            torch.load(tgt_files[i].with_suffix(".pt"), weights_only=True)
-            if tgt_files[i].with_suffix(".pt").exists()
-            else self._mel(self._load(tgt_files[i]))
-            for i in ctx_indices
-        ]
+        max_mel_frames = int(self.max_samples * (MEL_SAMPLE_RATE / SAMPLE_RATE) / 256)
+
+        mels = []
+        for i in ctx_indices:
+            cache = tgt_files[i].with_suffix(".pt")
+            if cache.exists():
+                mel = torch.load(cache, weights_only=True).float()
+                if mel.shape[-1] > max_mel_frames:
+                    start = random.randint(0, mel.shape[-1] - max_mel_frames)
+                    mel = mel[:, start : start + max_mel_frames]
+            else:
+                mel = self._mel(self._load(tgt_files[i]))
+            mels.append(mel)
         max_T = max(m.shape[-1] for m in mels)
         context_mels = torch.stack([
             F.pad(m, (0, max_T - m.shape[-1])) for m in mels

@@ -135,17 +135,19 @@ class VoiceConversionModel(nn.Module):
         audio_chunk: Tensor,
         C: Tensor,
         ctx_mask: Tensor | None = None,
+        f0_stats: tuple | None = None,
     ) -> Tensor:
         """
         Args:
             audio_chunk: [1, T]              16 kHz PCM float32
             C:           [1, T_ctx, D_MODEL] pre-cached context sequence
             ctx_mask:    [1, T_ctx]          bool, True = padding (optional)
+            f0_stats:    (src_mean, src_std, tgt_mean, tgt_std) floats, or None
         Returns:
             waveform:    [1, 1, T_out]       24000 Hz float32
         """
         self.eval()
-        content = self.content_encoder(audio_chunk)
+        content = self.content_encoder(audio_chunk, f0_stats=f0_stats)
         fused = self.cross_attention(content, C, key_padding_mask=ctx_mask)
         mel = self.decoder(fused)
         wav = self.vocoder(mel.transpose(1, 2))

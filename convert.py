@@ -20,6 +20,7 @@ import argparse
 import sys
 from pathlib import Path
 
+import numpy as np
 import soundfile as sf
 import torch
 import torchaudio
@@ -54,6 +55,19 @@ def audio_to_mel(audio: torch.Tensor, device: torch.device) -> torch.Tensor:
     return torch.log(mel.clamp(min=1e-5))
 
 
+def extract_f0_stats(audio: torch.Tensor, model) -> tuple | None:
+    """Return (mean_hz, std_hz) of voiced frames from audio [1, T] at 16 kHz, or None."""
+    if not model.content_encoder._crepe_available:
+        return None
+    with torch.no_grad():
+        f0 = model.content_encoder._extract_f0(audio)   # [1, T_frames, 1]
+    f0_np = f0[0, :, 0].cpu().numpy()
+    voiced = f0_np > 0.0
+    if voiced.sum() < 2:
+        return None
+    return float(f0_np[voiced].mean()), float(max(f0_np[voiced].std(), 5.0))
+
+
 def convert(args) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
@@ -70,20 +84,36 @@ def convert(args) -> None:
 
     # ── Compute context vector C from reference audio(s) ─────────────────────
     print(f"Computing speaker context from {len(args.reference)} reference file(s) …")
+    ref_audios = []
     ref_mels = []
     for ref_path in args.reference:
         ref_audio = load_audio(ref_path, device)   # [1, T]
+        ref_audios.append(ref_audio)
         ref_mel = audio_to_mel(ref_audio, device)  # [1, N_MELS, T_mel]
         ref_mels.append(ref_mel)
 
-    C = model.compute_context(ref_mels)            # [1, 256]
+    C = model.compute_context(ref_mels)            # [1, T_ctx, d_model]
     print(f"Context vector computed: {C.shape}")
+
+    # Target speaker F0 stats (from all reference audio concatenated)
+    all_ref_audio = torch.cat(ref_audios, dim=-1)  # [1, T_total_ref]
+    tgt_f0 = extract_f0_stats(all_ref_audio, model)
 
     # ── Load source audio ─────────────────────────────────────────────────────
     print(f"Loading source: {args.source}")
     source = load_audio(args.source, device)       # [1, T_total]
     T_total = source.shape[-1]
     print(f"Source duration: {T_total / SAMPLE_RATE:.2f}s ({T_total} samples)")
+
+    # Source speaker F0 stats (from full source audio)
+    src_f0 = extract_f0_stats(source, model)
+
+    f0_stats = None
+    if src_f0 and tgt_f0:
+        f0_stats = (src_f0[0], src_f0[1], tgt_f0[0], tgt_f0[1])
+        print(f"F0 shifting: src={src_f0[0]:.1f}±{src_f0[1]:.1f} Hz → tgt={tgt_f0[0]:.1f}±{tgt_f0[1]:.1f} Hz")
+    else:
+        print("F0 shifting disabled (torchcrepe unavailable or no voiced frames)")
 
     # Reset DFN state once for the full conversion pass
     model.content_encoder.reset_dfn_state(batch_size=1)
@@ -100,7 +130,7 @@ def convert(args) -> None:
             print(f"Skipping final {chunk.shape[-1]}-sample chunk (too short).")
             break
 
-        wav_out = model.convert_chunk(chunk, C)    # [1, 1, T_out]
+        wav_out = model.convert_chunk(chunk, C, f0_stats=f0_stats)    # [1, 1, T_out]
         output_chunks.append(wav_out.squeeze(0))   # [1, T_out]
 
         pct = min(end, T_total) / T_total * 100

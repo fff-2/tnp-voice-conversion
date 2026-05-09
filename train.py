@@ -373,11 +373,27 @@ def _validate(
                 SAMPLE_RATE,
             )
 
+            # F0 stats for pitch shifting (source speaker → target speaker range)
+            sample_f0_stats = None
+            if model.content_encoder._crepe_available:
+                with torch.no_grad():
+                    src_f0 = model.content_encoder._extract_f0(source[0:1, :src_len])
+                    tgt_f0 = model.content_encoder._extract_f0(target[0:1, :tgt_len])
+                src_voiced = src_f0[0, :, 0].cpu().numpy()
+                tgt_voiced = tgt_f0[0, :, 0].cpu().numpy()
+                src_v = src_voiced[src_voiced > 0.0]
+                tgt_v = tgt_voiced[tgt_voiced > 0.0]
+                if len(src_v) > 1 and len(tgt_v) > 1:
+                    sample_f0_stats = (
+                        float(src_v.mean()), float(max(src_v.std(), 5.0)),
+                        float(tgt_v.mean()), float(max(tgt_v.std(), 5.0)),
+                    )
+
             # Converted: source content + target speaker C → vocoder (24000 Hz out)
             with torch.amp.autocast(
                 "cuda", dtype=torch.bfloat16, enabled=(device.type == "cuda")
             ):
-                src_content = model.content_encoder(source[0:1, :src_len])
+                src_content = model.content_encoder(source[0:1, :src_len], f0_stats=sample_f0_stats)
                 src_fused = model.cross_attention(
                     src_content, C[0:1], key_padding_mask=ctx_mask[0:1]
                 )

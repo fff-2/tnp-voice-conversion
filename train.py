@@ -157,6 +157,7 @@ def train(args) -> None:
             target = batch["target_audio"].to(device)  # [B, T_tgt]
             ctx_mels = batch["context_mels"].to(device)  # [B, N_CTX, N_MELS, T_ctx]
             target_lengths = batch["target_lengths"]     # list[int], unpadded lengths
+            ctx_mel_lens = batch["ctx_mel_lens"]         # list[B] of list[N_CTX] ints
 
             B, N, M, T_ctx = ctx_mels.shape
             # Flatten context batch for context encoder
@@ -166,16 +167,30 @@ def train(args) -> None:
                 "cuda", dtype=torch.bfloat16, enabled=(device.type == "cuda")
             ):
                 # ── Context encoding ──────────────────────────────────────────
-                C_all = model.context_encoder(ctx_flat)       # [B*N, T_ctx_enc, d_model]
-                T_ctx_enc = C_all.shape[1]
-                C = C_all.view(B, N, T_ctx_enc, -1).mean(dim=1)  # [B, T_ctx_enc, d_model]
+                C_all = model.context_encoder(ctx_flat)  # [B*N, T_ctx, d_model]
+                T_ctx_enc = C_all.shape[1]               # == T_ctx (no temporal stride)
+                # Concatenate N reference sequences along the time axis (TNP style),
+                # matching encode_references() used at inference.
+                C = C_all.view(B, N * T_ctx_enc, -1)     # [B, N*T_ctx, d_model]
+
+                # ── Context padding mask ──────────────────────────────────────
+                # True = position is zero-padding; prevents it from polluting attention.
+                # Each item i has N mels; mel n occupies positions [n*T_ctx_enc, (n+1)*T_ctx_enc).
+                # Valid frames = ctx_mel_lens[i][n]; remainder is zero-padding.
+                ctx_mask = torch.ones(B, N * T_ctx_enc, dtype=torch.bool, device=device)
+                for i in range(B):
+                    for n in range(N):
+                        valid = ctx_mel_lens[i][n]
+                        ctx_mask[i, n * T_ctx_enc : n * T_ctx_enc + valid] = False
 
                 # ── Content encoding (frozen, no grad) ────────────────────────
                 with torch.no_grad():
                     content = model.content_encoder(target)   # [B, T_frames, 769]
 
                 # ── Cross-attention + decode ──────────────────────────────────
-                fused = model.cross_attention(content, C)     # [B, T_frames, d_model]
+                fused = model.cross_attention(
+                    content, C, key_padding_mask=ctx_mask
+                )                                             # [B, T_frames, d_model]
                 pred_mel = model.decoder(fused)               # [B, T_mel_pred, N_MELS]
 
                 # ── Target mel ────────────────────────────────────────────────
@@ -280,17 +295,25 @@ def _validate(
         ctx_mels = batch["context_mels"].to(device)
 
         target_lengths = batch["target_lengths"]
+        ctx_mel_lens = batch["ctx_mel_lens"]  # list[B] of list[N_CTX] ints
         B, N, M, T_ctx = ctx_mels.shape
         ctx_flat = ctx_mels.view(B * N, M, T_ctx)
 
         with torch.amp.autocast(
             "cuda", dtype=torch.bfloat16, enabled=(device.type == "cuda")
         ):
-            C_all = model.context_encoder(ctx_flat)
+            C_all = model.context_encoder(ctx_flat)   # [B*N, T_ctx, d_model]
             T_ctx_enc = C_all.shape[1]
-            C = C_all.view(B, N, T_ctx_enc, -1).mean(dim=1)  # [B, T_ctx_enc, d_model]
+            C = C_all.view(B, N * T_ctx_enc, -1)      # [B, N*T_ctx, d_model]
+
+            ctx_mask = torch.ones(B, N * T_ctx_enc, dtype=torch.bool, device=device)
+            for i in range(B):
+                for n in range(N):
+                    valid = ctx_mel_lens[i][n]
+                    ctx_mask[i, n * T_ctx_enc : n * T_ctx_enc + valid] = False
+
             content = model.content_encoder(target)
-            fused = model.cross_attention(content, C)
+            fused = model.cross_attention(content, C, key_padding_mask=ctx_mask)
             pred_mel = model.decoder(fused)
             tgt_mel = mel_transform(mel_resampler(target)).transpose(1, 2)
             tgt_mel = torch.log(tgt_mel.clamp(min=1e-5))
@@ -331,7 +354,9 @@ def _validate(
                 "cuda", dtype=torch.bfloat16, enabled=(device.type == "cuda")
             ):
                 src_content = model.content_encoder(source[0:1])
-                src_fused = model.cross_attention(src_content, C[0:1])
+                src_fused = model.cross_attention(
+                    src_content, C[0:1], key_padding_mask=ctx_mask[0:1]
+                )
                 src_mel = model.decoder(src_fused)
                 wav = model.vocoder(src_mel.transpose(1, 2))  # [1, 1, T_wav]
             sf.write(

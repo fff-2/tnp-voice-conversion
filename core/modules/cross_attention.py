@@ -44,13 +44,19 @@ class CrossAttentionFusion(nn.Module):
         )
         self.ffn_norm = nn.LayerNorm(d_model)
 
-    def forward(self, content: Tensor, C: Tensor) -> Tensor:
+    def forward(
+        self,
+        content: Tensor,
+        C: Tensor,
+        key_padding_mask: Tensor | None = None,
+    ) -> Tensor:
         """
         Args:
-            content: [B, T_frames, content_dim]   source content features
-            C:       [B, T_ctx, d_model]           target context sequence
+            content:          [B, T_frames, content_dim]   source content features
+            C:                [B, T_ctx,    d_model]        target context sequence
+            key_padding_mask: [B, T_ctx]    bool, True = padding (ignored by attention)
         Returns:
-            fused:   [B, T_frames, d_model]
+            fused:            [B, T_frames, d_model]
         """
         Q = self.q_proj(content)           # [B, T_frames, d_model]
         attn_out, _ = self.attn(
@@ -58,6 +64,7 @@ class CrossAttentionFusion(nn.Module):
             key=C,
             value=C,
             need_weights=False,
+            key_padding_mask=key_padding_mask,  # masks zero-padded context frames
         )                                  # [B, T_frames, d_model]
         x = self.out_norm(Q + attn_out)    # [B, T_frames, d_model]
         x = self.ffn_norm(x + self.ffn(x)) # [B, T_frames, d_model]

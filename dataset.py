@@ -39,7 +39,8 @@ class SpeakerDataset(Dataset):
     Each __getitem__ returns:
         source_audio   [T_src]             source speaker waveform @ 16 kHz
         target_audio   [T_tgt]             target speaker waveform @ 16 kHz
-        context_mels   [N_CTX, N_MELS, T]  reference mels from target speaker
+        context_mels   [N_CTX, N_MELS, T]  reference mels from target speaker (zero-padded)
+        ctx_mel_lens   list[N_CTX]         unpadded T length of each reference mel
     """
 
     def __init__(
@@ -156,6 +157,7 @@ class SpeakerDataset(Dataset):
         max_mel_frames = int(self.max_samples * (MEL_SAMPLE_RATE / SAMPLE_RATE) / 256)
 
         mels = []
+        mel_lens = []
         for i in ctx_indices:
             cache = tgt_files[i].with_suffix(".pt")
             if cache.exists():
@@ -165,6 +167,7 @@ class SpeakerDataset(Dataset):
                     mel = mel[:, start : start + max_mel_frames]
             else:
                 mel = self._mel(self._load(tgt_files[i]))
+            mel_lens.append(mel.shape[-1])  # unpadded T for this mel
             mels.append(mel)
         max_T = max(m.shape[-1] for m in mels)
         context_mels = torch.stack([
@@ -175,6 +178,7 @@ class SpeakerDataset(Dataset):
             "source_audio": source_audio,
             "target_audio": target_audio,
             "context_mels": context_mels,
+            "ctx_mel_lens": mel_lens,   # list[N_CTX] of ints: unpadded T per ref mel
         }
 
 
@@ -195,4 +199,7 @@ def collate_fn(batch: list[dict]) -> dict:
         "target_audio": pad1d([b["target_audio"] for b in batch]),
         "context_mels": pad_mels([b["context_mels"] for b in batch]),
         "target_lengths": [b["target_audio"].shape[0] for b in batch],
+        # list[B] of list[N_CTX]: unpadded mel-frame count per reference utterance.
+        # Used to build key_padding_mask for cross-attention (True = padding position).
+        "ctx_mel_lens": [b["ctx_mel_lens"] for b in batch],
     }

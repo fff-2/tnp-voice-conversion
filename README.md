@@ -73,9 +73,9 @@ voice/
 │
 ├── core/
 │   ├── modules/
-│   │   ├── context_encoder.py  # Transformer mean-pool → C [256]
-│   │   ├── content_encoder.py  # DeepFilterNet3 + HuBERT + torchcrepe F0
-│   │   ├── cross_attention.py  # Q=content, K/V=C
+│   │   ├── context_encoder.py  # Transformer, no PE/mean-pool → C [B, T_ctx, 256]
+│   │   ├── content_encoder.py  # DeepFilterNet3 + HuBERT (InstanceNorm) + torchcrepe F0
+│   │   ├── cross_attention.py  # Q=content, K/V=C, key_padding_mask
 │   │   └── decoder.py          # Conv1d + Transformer + 1.875× upsample → Mel [100]
 │   ├── model.py                # Full pipeline wrapper
 │   └── vocoder.py              # Vocos vocoder wrapper (frozen, 24 kHz)
@@ -190,11 +190,8 @@ HuBERT layer-6 features are not perfectly speaker-agnostic — some identity lea
 
 **Signs:** converted audio sounds like the source, not the target; validation loss is low but listening tests are poor.
 
-**Mitigations (in increasing complexity):**
-
-1. **Information bottleneck** — narrow FC layer or vector quantization (VQ) between content encoder and cross-attention
-2. **Speaker perturbation** — randomly pitch-shift or formant-shift `target_audio` before the content encoder, breaking absolute spectral cues
-3. **Speaker adversarial loss** — classifier head on content features trained adversarially to strip speaker identity from the content path
+**Implemented mitigation — HuBERT Instance Normalization:**
+The content encoder applies `F.instance_norm` to HuBERT features before the F0 concat. It normalises each `(sample, channel)` pair to mean=0 / std=1 across the time dimension, stripping the per-sample spectral bias that encodes speaker timbre. This is a hard constraint: the model *cannot* reconstruct speaker identity from content features alone and must consult `C` via cross-attention. See the Implementation Notes for technical details.
 
 ---
 
@@ -306,6 +303,7 @@ batch = next(iter(loader))
 print(batch["source_audio"].shape)   # [B, T_src]
 print(batch["target_audio"].shape)   # [B, T_tgt]
 print(batch["context_mels"].shape)   # [B, N_CTX, 100, T_ctx]
+print(batch["ctx_mel_lens"])         # list[B] of list[N_CTX]: unpadded T per ref mel
 ```
 
 </details>
@@ -586,6 +584,36 @@ The training loss is divided by `GRAD_ACCUM` before `.backward()`. If you add a 
 **bfloat16 AMP — no GradScaler needed**
 Training uses `torch.bfloat16` via `torch.amp.autocast`. Unlike float16, bfloat16 has the same exponent range as float32 so activations never overflow to `inf`/`NaN`. `GradScaler` has been removed — it only exists to work around float16 underflow and is a no-op for bfloat16.
 
+**HuBERT Instance Normalization — anti-copy-synthesis**
+`F.instance_norm` is applied to the HuBERT features `[B, 768, T_frames]` before they are concatenated with F0. Instance norm normalises each `(sample, channel)` pair independently across the time axis, removing any per-sample mean/variance that would carry speaker-specific spectral cues through the content path. Because this is a deterministic, parameter-free operation, it adds no trainable parameters and costs negligible compute.
+```python
+# content_encoder.py — forward()
+hubert_norm = F.instance_norm(hubert_feat.transpose(1, 2)).transpose(1, 2)
+content = torch.cat([hubert_norm, f0], dim=-1)   # [B, T_frames, 769]
+```
+
+**TNP training / inference consistency**
+At inference `encode_references()` **concatenates** N reference sequences along the time axis: `torch.cat(encoded, dim=1)` → `[1, N·T_ctx, 256]`. The training loop must mirror this exactly. The old code averaged with `.mean(dim=1)` which mixed frames from completely different utterances and broke the TNP contract.
+The correct reshape is:
+```python
+# train.py
+C = C_all.view(B, N * T_ctx_enc, -1)   # [B, N·T_ctx, d_model]  ← concatenate, not mean
+```
+
+**Context key_padding_mask — exclude padded reference frames**
+Context mels are zero-padded in two places: within `__getitem__` (different mels padded to the item-level maximum T) and in `collate_fn` (items padded to the batch-level maximum T). These zero regions — `F.pad` fills with `0.0`, not a valid log-mel value — must not participate in cross-attention softmax.
+
+`dataset.py` records the unpadded length of every reference mel as `ctx_mel_lens: list[N_CTX]` per item. `collate_fn` aggregates it into `ctx_mel_lens: list[B][N_CTX]`. The training loop builds a boolean mask:
+```python
+# True = padding position (ignored by MultiheadAttention)
+ctx_mask = torch.ones(B, N * T_ctx_enc, dtype=torch.bool, device=device)
+for i in range(B):
+    for n in range(N):
+        ctx_mask[i, n * T_ctx_enc : n * T_ctx_enc + ctx_mel_lens[i][n]] = False
+model.cross_attention(content, C, key_padding_mask=ctx_mask)
+```
+At inference, `encode_references()` processes one utterance at a time so there is no padding; `ctx_mask` is `None` (the default).
+
 </details>
 
 ---
@@ -617,6 +645,7 @@ s  = ds[0]
 print("source_audio:", s["source_audio"].shape)
 print("target_audio:", s["target_audio"].shape)
 print("context_mels:", s["context_mels"].shape)   # [N_CTX, 100, T_ctx]
+print("ctx_mel_lens:", s["ctx_mel_lens"])          # list[N_CTX] of ints
 EOF
 ```
 

@@ -103,13 +103,14 @@ class VoiceConversionModel(nn.Module):
 
     def forward(
         self,
-        source_audio: Tensor,   # [B, T_src]   source speaker waveform, 16 kHz
-        context_mel: Tensor,    # [B, N_MELS, T_ctx]  target speaker reference mel
-        target_audio: Tensor,   # [B, T_tgt]   target speaker waveform (for loss)
+        source_audio: Tensor,             # [B, T_src]          source waveform, 16 kHz
+        context_mel: Tensor,              # [B, N_MELS, T_ctx]  target reference mel
+        target_audio: Tensor,             # [B, T_tgt]          target waveform (loss)
+        ctx_mask: Tensor | None = None,   # [B, T_ctx]  bool, True = padding
     ) -> tuple:
         C = self.context_encoder(context_mel)
         content = self.content_encoder(source_audio)
-        fused = self.cross_attention(content, C)
+        fused = self.cross_attention(content, C, key_padding_mask=ctx_mask)
         pred_mel = self.decoder(fused)
         target_mel = self._compute_mel(target_audio)
         T = min(pred_mel.shape[1], target_mel.shape[1])
@@ -129,17 +130,23 @@ class VoiceConversionModel(nn.Module):
         return self.context_encoder.encode_references(reference_mels)
 
     @torch.no_grad()
-    def convert_chunk(self, audio_chunk: Tensor, C: Tensor) -> Tensor:
+    def convert_chunk(
+        self,
+        audio_chunk: Tensor,
+        C: Tensor,
+        ctx_mask: Tensor | None = None,
+    ) -> Tensor:
         """
         Args:
             audio_chunk: [1, T]              16 kHz PCM float32
             C:           [1, T_ctx, D_MODEL] pre-cached context sequence
+            ctx_mask:    [1, T_ctx]          bool, True = padding (optional)
         Returns:
             waveform:    [1, 1, T_out]       24000 Hz float32
         """
         self.eval()
         content = self.content_encoder(audio_chunk)
-        fused = self.cross_attention(content, C)
+        fused = self.cross_attention(content, C, key_padding_mask=ctx_mask)
         mel = self.decoder(fused)
         wav = self.vocoder(mel.transpose(1, 2))
         return wav

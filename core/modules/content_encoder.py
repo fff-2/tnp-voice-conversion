@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torchaudio
 import torchaudio.functional as AF
 import numpy as np
@@ -170,9 +171,17 @@ class ContentEncoder(nn.Module):
         hubert_feat = hubert_feat[:, :T, :]
         f0 = f0[:, :T, :]
 
-        # Step 4: log-scale F0 then concatenate
+        # Step 4: instance-normalise HuBERT to strip residual speaker timbre.
+        # F.instance_norm expects [B, C, T]: normalises each (sample, channel) pair
+        # across T independently, removing per-sample mean/variance that encodes
+        # speaker identity and forcing the model to rely on context C for timbre.
+        hubert_norm = F.instance_norm(
+            hubert_feat.transpose(1, 2)   # [B, 768, T_frames]
+        ).transpose(1, 2)                 # [B, T_frames, 768]
+
+        # Step 5: log-scale F0 then concatenate
         # Fix 2: raw F0 spans [0, 2006] Hz vs HuBERT features in [-3, +3].
         # log1p maps F0 to [0, ~7.6], preventing F0 from dominating the projection.
         f0 = torch.log1p(f0)
-        content = torch.cat([hubert_feat, f0], dim=-1)  # [B, T_frames, 769]
+        content = torch.cat([hubert_norm, f0], dim=-1)  # [B, T_frames, 769]
         return content

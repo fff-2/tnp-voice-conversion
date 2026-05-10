@@ -164,19 +164,20 @@ def train(args) -> None:
             # Flatten context batch for context encoder
             ctx_flat = ctx_mels.view(B * N, M, T_ctx)  # [B*N, N_MELS, T_ctx]
 
-            # ── Pitch perturbation (disentanglement augmentation) ─────────────
+            # ── Pitch perturbation (disentanglement augmentation, p=0.5) ────────
             # Randomly shift pitch of the content-encoder input by ±6 semitones.
             # The target mel is computed from the ORIGINAL target so the model
             # must use context C to recover the correct pitch — breaking copy-synthesis.
-            n_steps = random.uniform(-6.0, 6.0)
-            # Frequency ratio corresponding to n_steps semitones.
-            # Used below to undo the pitch shift in the F0 feature without an
-            # extra crepe pass: f0_stats=(0, ratio, 0, 1) → feature_f0 = f0/ratio.
-            pitch_ratio = 2.0 ** (n_steps / 12.0)
-            with torch.no_grad():
-                target_shifted = torchaudio.functional.pitch_shift(
-                    target.float(), SAMPLE_RATE, n_steps
-                ).to(target.dtype)  # back to bf16 if target was bf16
+            if random.random() < 0.5:
+                n_steps = random.uniform(-6.0, 6.0)
+                pitch_ratio = 2.0 ** (n_steps / 12.0)
+                with torch.no_grad():
+                    target_shifted = torchaudio.functional.pitch_shift(
+                        target.float(), SAMPLE_RATE, n_steps
+                    ).to(target.dtype)
+            else:
+                target_shifted = target
+                pitch_ratio = 1.0
 
             with torch.amp.autocast(
                 "cuda", dtype=torch.bfloat16, enabled=(device.type == "cuda")

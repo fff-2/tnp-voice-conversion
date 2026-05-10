@@ -20,6 +20,7 @@ Usage:
 import argparse
 import csv
 import math
+import random
 import sys
 from pathlib import Path
 
@@ -163,6 +164,20 @@ def train(args) -> None:
             # Flatten context batch for context encoder
             ctx_flat = ctx_mels.view(B * N, M, T_ctx)  # [B*N, N_MELS, T_ctx]
 
+            # ── Pitch perturbation (disentanglement augmentation) ─────────────
+            # Randomly shift pitch of the content-encoder input by ±6 semitones.
+            # The target mel is computed from the ORIGINAL target so the model
+            # must use context C to recover the correct pitch — breaking copy-synthesis.
+            n_steps = random.uniform(-6.0, 6.0)
+            # Frequency ratio corresponding to n_steps semitones.
+            # Used below to undo the pitch shift in the F0 feature without an
+            # extra crepe pass: f0_stats=(0, ratio, 0, 1) → feature_f0 = f0/ratio.
+            pitch_ratio = 2.0 ** (n_steps / 12.0)
+            with torch.no_grad():
+                target_shifted = torchaudio.functional.pitch_shift(
+                    target.float(), SAMPLE_RATE, n_steps
+                ).to(target.dtype)  # back to bf16 if target was bf16
+
             with torch.amp.autocast(
                 "cuda", dtype=torch.bfloat16, enabled=(device.type == "cuda")
             ):
@@ -195,8 +210,14 @@ def train(args) -> None:
                         ctx_mask[i, n * T_ctx_enc : n * T_ctx_enc + valid] = False
 
                 # ── Content encoding (frozen, no grad) ────────────────────────
+                # F0 shifting undoes the pitch perturbation at feature level:
+                # (0, pitch_ratio, 0, 1) → f0_feature = f0_shifted / pitch_ratio = f0_original
+                # Forces the model to rely on C for pitch rather than content features.
                 with torch.no_grad():
-                    content = model.content_encoder(target)  # [B, T_frames, 769]
+                    content = model.content_encoder(
+                        target_shifted,
+                        f0_stats=(0.0, float(pitch_ratio), 0.0, 1.0),
+                    )  # [B, T_frames, 769]
 
                 # ── Cross-attention + decode ──────────────────────────────────
                 fused = model.cross_attention(

@@ -190,8 +190,13 @@ HuBERT layer-6 features are not perfectly speaker-agnostic — some identity lea
 
 **Signs:** converted audio sounds like the source, not the target; validation loss is low but listening tests are poor.
 
-**Implemented mitigation — HuBERT Instance Normalization:**
+**Mitigation 1 — HuBERT Instance Normalization:**
 The content encoder applies `F.instance_norm` to HuBERT features before the F0 concat. It normalises each `(sample, channel)` pair to mean=0 / std=1 across the time dimension, stripping the per-sample spectral bias that encodes speaker timbre. This is a hard constraint: the model *cannot* reconstruct speaker identity from content features alone and must consult `C` via cross-attention. See the Implementation Notes for technical details.
+
+**Mitigation 2 — Random Pitch Perturbation + F0 Feature Shifting:**
+Each training batch, the audio fed to the content encoder is pitch-shifted by a random amount uniformly sampled from **±6 semitones** using `torchaudio.functional.pitch_shift`. The target mel is computed from the **original, unshifted audio** — so the model cannot copy pitch from the content features and must recover the correct pitch from `C`.
+
+To complement this, the F0 feature inside the content encoder is corrected back to the original pitch range via `f0_stats=(0.0, ratio, 0.0, 1.0)` where `ratio = 2^(n_steps/12)`. This applies the transform `f0_feature = f0_shifted / ratio = f0_original` with no extra crepe pass, making training consistent with the F0-shifting behaviour used at inference.
 
 ---
 
@@ -300,9 +305,11 @@ ds     = SpeakerDataset("datasets/VCTK-Corpus-0.92/wav48_silence_trimmed", split
 loader = DataLoader(ds, batch_size=8, collate_fn=collate_fn, shuffle=True)
 
 batch = next(iter(loader))
-print(batch["source_audio"].shape)   # [B, T_src]
-print(batch["target_audio"].shape)   # [B, T_tgt]
+print(batch["source_audio"].shape)   # [B, T_src]  — zero-padded to batch max
+print(batch["target_audio"].shape)   # [B, T_tgt]  — zero-padded to batch max
 print(batch["context_mels"].shape)   # [B, N_CTX, 100, T_ctx]
+print(batch["source_lengths"])       # list[B]: unpadded sample count per source
+print(batch["target_lengths"])       # list[B]: unpadded sample count per target
 print(batch["ctx_mel_lens"])         # list[B] of list[N_CTX]: unpadded T per ref mel
 ```
 
@@ -484,6 +491,14 @@ python convert.py --source me.wav --reference alice.wav --output converted.wav
 python convert.py --source me.wav --reference alice_1.wav alice_2.wav alice_3.wav --output converted.wav
 ```
 
+**F0 shifting** is applied automatically: `convert.py` extracts F0 statistics from both the source audio and all reference files (concatenated), then maps the source speaker's pitch contour into the target speaker's fundamental frequency range. This is printed at runtime:
+
+```
+F0 shifting: src=120.3±18.4 Hz → tgt=210.7±22.1 Hz
+```
+
+If torchcrepe is not installed or either speaker has no voiced frames, F0 shifting is skipped silently and a message is printed instead.
+
 <details>
 <summary>All flags</summary>
 
@@ -557,16 +572,29 @@ In streaming mode the DFN GRU must only advance over **new** audio. `mic_convert
 **HuBERT layer index**
 `HUBERT_BASE.extract_features()` returns a list of 12 tensors (one per transformer layer). Index `5` (0-based) is transformer layer 6 — the correct layer for mid-level linguistic content.
 
+**Audio loading — soundfile, not torchaudio.load**
+`convert.py` and `mic_convert.py` load audio with `soundfile.read()` directly. Recent versions of torchaudio default to `torchcodec` as the backend, which is not installed in this environment. `soundfile` natively handles WAV, FLAC, OGG, and AIFF without any codec dependency. `dataset.py` has always used `soundfile`; the inference scripts were updated to match.
+
+**Pitch perturbation training augmentation**
+Each training batch, the audio fed to the content encoder is pitch-shifted by a random `n_steps ∈ Uniform(−6, +6)` semitones using `torchaudio.functional.pitch_shift` (phase vocoder, runs in float32 on GPU). The target mel is computed from the **original** audio. This prevents copy-synthesis: the model cannot read the correct pitch from content features and must recover it from `C`.
+
+The F0 feature inside the content encoder is then corrected via `f0_stats=(0.0, ratio, 0.0, 1.0)` where `ratio = 2^(n_steps/12)`, which applies `f0_feature = f0_shifted / ratio ≈ f0_original` — no extra crepe inference required. This keeps training consistent with the F0 Z-score shifting applied at inference.
+
 **F0 log scaling and cross-speaker Z-score shift**
 Raw F0 from torchcrepe spans `[0, 2006]` Hz while HuBERT features fall roughly in `[-3, +3]`. `torch.log1p(f0)` maps F0 to `[0, ~7.6]`, preventing it from dominating the linear projection.
 
-For cross-gender or wide-pitch-range conversion, `ContentEncoder.forward()` accepts an optional `f0_stats=(src_mean, src_std, tgt_mean, tgt_std)` tuple. When provided, voiced frames (f0 > 0) are Z-score shifted before `log1p`:
+`ContentEncoder.forward()` accepts an optional `f0_stats=(src_mean, src_std, tgt_mean, tgt_std)` tuple. When provided, voiced frames (f0 > 0) are Z-score shifted before `log1p`:
 ```python
 voiced_mask = (f0 > 0.0).float()
 f0_shifted = (f0 - src_mean) / (src_std + 1e-5) * tgt_std + tgt_mean
 f0 = voiced_mask * f0_shifted.clamp(min=0.0) + (1.0 - voiced_mask) * f0
 ```
-Unvoiced frames (f0 == 0) are left unchanged. This shifts the source speaker's pitch contour into the target speaker's fundamental frequency range — without it, a male-to-female conversion will have the correct timbre but the wrong pitch register. In `mic_convert.py`, target stats are extracted from the reference audio at startup; source stats are tracked via EMA over the streaming session and only applied after `STATS_WARMUP=15` chunks.
+Unvoiced frames (f0 == 0) are left unchanged. This shifts the source speaker's pitch contour into the target speaker's fundamental frequency range — without it, a male-to-female conversion will have the correct timbre but the wrong pitch register.
+
+`f0_stats` is used in three places:
+- **`convert.py`** — extracted from source and concatenated reference audio once before the chunk loop; applied to every chunk.
+- **`mic_convert.py`** — target stats extracted from reference at startup; source stats tracked via EMA over the streaming session, applied after `STATS_WARMUP=15` chunks.
+- **Training `_validate` samples** — extracted from the unpadded source and target audio of the first validation batch item; applied only to the `converted.wav` sample, not to the loss computation.
 
 **F0 decoder — argmax, not Viterbi**
 `torchcrepe` is configured with `decoder=torchcrepe.decode.argmax`. Viterbi is a global dynamic-programming algorithm that requires the full sequence and is incompatible with chunk-by-chunk streaming. Argmax is frame-independent and causal.
@@ -579,6 +607,9 @@ Speaker identity (timbre, vocal tract shape) is time-invariant. Absolute positio
 
 **Masked L1 loss**
 The training loss is computed only over valid (non-padded) mel frames. `collate_fn` returns `target_lengths` (original audio sample counts); the training loop converts these to mel frame counts and builds a boolean mask before calling `F.l1_loss(..., reduction="none")`. Padding regions contain `log(1e-5) ≈ −11.5` and would otherwise waste model capacity if included in the loss.
+
+**Batch padding and source/target lengths**
+`collate_fn` zero-pads `source_audio` and `target_audio` to the batch maximum length. Both `source_lengths` and `target_lengths` are returned alongside the padded tensors so callers can recover the unpadded region. When saving validation audio samples, `source[0, :source_lengths[0]]` and `target[0, :target_lengths[0]]` are used — feeding the full padded tensor (including zero-padding) into HuBERT causes garbage features for the silent tail, producing silence in the converted output after the real audio ends.
 
 **Vocos input format**
 The decoder outputs `[B, T_mel, 100]` (channels-last). Vocos expects `[B, 100, T_mel]` (channels-first). Always transpose before calling the vocoder: `vocoder(mel.transpose(1, 2))`.

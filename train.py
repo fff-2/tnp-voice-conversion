@@ -168,8 +168,8 @@ def train(args) -> None:
             # Randomly shift pitch of the content-encoder input by ±6 semitones.
             # The target mel is computed from the ORIGINAL target so the model
             # must use context C to recover the correct pitch — breaking copy-synthesis.
-            if random.random() < 0.5:
-                n_steps = random.uniform(-6.0, 6.0)
+            if random.random() < 0.3:
+                n_steps = random.uniform(-2.0, 2.0)
                 pitch_ratio = 2.0 ** (n_steps / 12.0)
                 with torch.no_grad():
                     target_shifted = torchaudio.functional.pitch_shift(
@@ -407,15 +407,19 @@ def _validate(
                 tgt_v = tgt_voiced[tgt_voiced > 0.0]
                 if len(src_v) > 1 and len(tgt_v) > 1:
                     sample_f0_stats = (
-                        float(src_v.mean()), float(max(src_v.std(), 5.0)),
-                        float(tgt_v.mean()), float(max(tgt_v.std(), 5.0)),
+                        float(src_v.mean()),
+                        float(max(src_v.std(), 5.0)),
+                        float(tgt_v.mean()),
+                        float(max(tgt_v.std(), 5.0)),
                     )
 
             # Converted: source content + target speaker C → vocoder (24000 Hz out)
             with torch.amp.autocast(
                 "cuda", dtype=torch.bfloat16, enabled=(device.type == "cuda")
             ):
-                src_content = model.content_encoder(source[0:1, :src_len], f0_stats=sample_f0_stats)
+                src_content = model.content_encoder(
+                    source[0:1, :src_len], f0_stats=sample_f0_stats
+                )
                 src_fused = model.cross_attention(
                     src_content, C[0:1], key_padding_mask=ctx_mask[0:1]
                 )

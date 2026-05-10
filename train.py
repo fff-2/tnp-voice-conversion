@@ -155,9 +155,9 @@ def train(args) -> None:
             if step >= MAX_STEPS:
                 break
 
-            target = batch["target_audio"].to(device)  # [B, T_tgt]
+            content_audio = batch["audio_content"].to(device)  # [B, T_content]
             ctx_mels = batch["context_mels"].to(device)  # [B, N_CTX, N_MELS, T_ctx]
-            target_lengths = batch["target_lengths"]  # list[int], unpadded lengths
+            content_lengths = batch["content_lengths"]  # list[int], unpadded sample counts
             ctx_mel_lens = batch["ctx_mel_lens"]  # list[B] of list[N_CTX] ints
 
             B, N, M, T_ctx = ctx_mels.shape
@@ -172,11 +172,11 @@ def train(args) -> None:
                 n_steps = random.uniform(-2.0, 2.0)
                 pitch_ratio = 2.0 ** (n_steps / 12.0)
                 with torch.no_grad():
-                    target_shifted = torchaudio.functional.pitch_shift(
-                        target.float(), SAMPLE_RATE, n_steps
-                    ).to(target.dtype)
+                    content_shifted = torchaudio.functional.pitch_shift(
+                        content_audio.float(), SAMPLE_RATE, n_steps
+                    ).to(content_audio.dtype)
             else:
-                target_shifted = target
+                content_shifted = content_audio
                 pitch_ratio = 1.0
 
             with torch.amp.autocast(
@@ -216,9 +216,13 @@ def train(args) -> None:
                 # Forces the model to rely on C for pitch rather than content features.
                 with torch.no_grad():
                     content = model.content_encoder(
-                        target_shifted,
+                        content_shifted,
                         f0_stats=(0.0, float(pitch_ratio), 0.0, 1.0),
                     )  # [B, T_frames, 769]
+
+                # Information bottleneck: zero out 20% of HuBERT features so the
+                # decoder must use context C for speaker timbre, not leaked identity.
+                content = F.dropout(content, p=0.2, training=model.training)
 
                 # ── Cross-attention + decode ──────────────────────────────────
                 fused = model.cross_attention(
@@ -226,15 +230,15 @@ def train(args) -> None:
                 )  # [B, T_frames, d_model]
                 pred_mel = model.decoder(fused)  # [B, T_mel_pred, N_MELS]
 
-                # ── Target mel ────────────────────────────────────────────────
+                # ── Target mel (always from unperturbed content_audio) ────────
                 with torch.no_grad():
-                    tgt_mel = compute_target_mel(target)  # [B, T_mel_tgt, N_MELS]
+                    tgt_mel = compute_target_mel(content_audio)  # [B, T_mel_tgt, N_MELS]
 
-                # ── Masked L1 loss (Fix 4: ignore padded frames) ──────────────
+                # ── Masked L1 loss (ignore padded frames) ─────────────────────
                 T = min(pred_mel.shape[1], tgt_mel.shape[1])
                 mel_lengths = [
                     1 + math.ceil(n_samples * VOCODER_SR / SAMPLE_RATE) // 256
-                    for n_samples in target_lengths
+                    for n_samples in content_lengths
                 ]
                 mask = torch.zeros(B, T, device=device, dtype=torch.bool)
                 for i, ml in enumerate(mel_lengths):
@@ -324,11 +328,11 @@ def _validate(
 
     for batch in loader:
         source = batch["source_audio"].to(device)
-        target = batch["target_audio"].to(device)
+        content_audio = batch["audio_content"].to(device)
         ctx_mels = batch["context_mels"].to(device)
 
         source_lengths = batch["source_lengths"]
-        target_lengths = batch["target_lengths"]
+        content_lengths = batch["content_lengths"]
         ctx_mel_lens = batch["ctx_mel_lens"]  # list[B] of list[N_CTX] ints
         B, N, M, T_ctx = ctx_mels.shape
         ctx_flat = ctx_mels.view(B * N, M, T_ctx)
@@ -354,15 +358,15 @@ def _validate(
                     valid = ctx_mel_lens[i][n]
                     ctx_mask[i, n * T_ctx_enc : n * T_ctx_enc + valid] = False
 
-            content = model.content_encoder(target)
+            content = model.content_encoder(content_audio)
             fused = model.cross_attention(content, C, key_padding_mask=ctx_mask)
             pred_mel = model.decoder(fused)
-            tgt_mel = mel_transform(mel_resampler(target)).transpose(1, 2)
+            tgt_mel = mel_transform(mel_resampler(content_audio)).transpose(1, 2)
             tgt_mel = torch.log(tgt_mel.clamp(min=1e-5))
             T = min(pred_mel.shape[1], tgt_mel.shape[1])
             mel_lengths = [
                 1 + math.ceil(n_samples * VOCODER_SR / SAMPLE_RATE) // 256
-                for n_samples in target_lengths
+                for n_samples in content_lengths
             ]
             mask = torch.zeros(B, T, device=device, dtype=torch.bool)
             for i, ml in enumerate(mel_lengths):
@@ -383,7 +387,7 @@ def _validate(
 
             # Raw waveforms at 16 kHz (first item of first batch, unpadded)
             src_len = source_lengths[0]
-            tgt_len = target_lengths[0]
+            tgt_len = content_lengths[0]
             sf.write(
                 str(sample_dir / "source.wav"),
                 source[0, :src_len].cpu().numpy(),
@@ -391,7 +395,7 @@ def _validate(
             )
             sf.write(
                 str(sample_dir / "target.wav"),
-                target[0, :tgt_len].cpu().numpy(),
+                content_audio[0, :tgt_len].cpu().numpy(),
                 SAMPLE_RATE,
             )
 
@@ -400,7 +404,7 @@ def _validate(
             if model.content_encoder._crepe_available:
                 with torch.no_grad():
                     src_f0 = model.content_encoder._extract_f0(source[0:1, :src_len])
-                    tgt_f0 = model.content_encoder._extract_f0(target[0:1, :tgt_len])
+                    tgt_f0 = model.content_encoder._extract_f0(content_audio[0:1, :tgt_len])
                 src_voiced = src_f0[0, :, 0].cpu().numpy()
                 tgt_voiced = tgt_f0[0, :, 0].cpu().numpy()
                 src_v = src_voiced[src_voiced > 0.0]

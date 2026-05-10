@@ -43,7 +43,7 @@ python preprocess.py --data-root datasets/wav48_silence_trimmed
 
 python train.py                                                    # train
 python mic_convert.py --checkpoint checkpoints/best.pt            # real-time
-python convert.py --source me.wav --reference alice.wav --output out.wav  # offline
+ python convert.py --source me.wav --reference alice.wav --output out.wav # offline
 ```
 
 ---
@@ -132,9 +132,9 @@ SOURCE SPEAKER (live mic / audio file)
 
 | Module | Trainable | Parameters |
 |---|---|---|
-| ContextEncoder | Yes | ~3.1 M |
-| CrossAttentionFusion | Yes | ~460 K |
-| MelDecoder | Yes | ~3.2 M |
+| ContextEncoder | Yes | ~3.2 M |
+| CrossAttentionFusion | Yes | ~1.0 M |
+| MelDecoder | Yes | ~2.6 M |
 | ContentEncoder (DFN3 + HuBERT + crepe) | No | ~122 M |
 | VocosVocoder | No | ~13.4 M |
 | **Total trainable** | | **~6.8 M (~26 MB fp32)** |
@@ -149,25 +149,30 @@ Voice conversion requires separating *what is said* (phonetic content) from *who
 
 VCTK and LibriSpeech are **non-parallel**: each speaker says different sentences. Computing a frame-wise L1 loss between "Speaker A saying *apple*" and "Speaker B saying *banana*" is meaningless — the mel spectrograms have nothing to compare.
 
-### Self-reconstruction
+### Self-reconstruction with cross-utterance separation
 
-The training loop uses a **self-reconstruction** objective to sidestep this entirely. The content encoder receives the **target audio** (not the source), and the loss is computed against the same target utterance:
+The training loop uses a **self-reconstruction** objective to sidestep the parallel-data problem. For each training sample, two **different utterances** from the same target speaker are loaded:
+
+- `audio_content` — the utterance whose linguistic content will be reconstructed
+- `context_mels` — N_CTX=5 reference utterances from the same speaker (always different clips from `audio_content`)
 
 ```
 Training forward pass
 ─────────────────────────────────────────────────────────────────────
-target_audio  ──→  [ContentEncoder (frozen)]  ──→  content features
-                        (HuBERT discards speaker acoustics,
-                         preserves phonetics)
+audio_content  ──→  [ContentEncoder (frozen)]  ──→  content features
+                         (HuBERT discards speaker acoustics,
+                          preserves phonetics)
+                    ──→  content dropout (p=0.2)  ──→  masked features
 
-context_mels  ──→  [ContextEncoder]  ──→  C  (target speaker embedding)
+context_mels   ──→  [ContextEncoder]  ──→  C  (target speaker embedding)
 
-content + C   ──→  [CrossAttention + Decoder]  ──→  pred_mel
+masked_content + C  ──→  [CrossAttention + Decoder]  ──→  pred_mel
 
-Loss:  L1( pred_mel,  mel(target_audio) )   ← both sides are the target
+Loss:  L1( pred_mel,  mel(audio_content) )   ← ground truth is always
+                                                the unperturbed original
 ```
 
-Because both prediction and ground truth derive from the same utterance, the loss is phonetically valid. The model must learn to inject speaker identity from `C` to reconstruct `target_mel` — it cannot shortcut by aligning with a different sentence.
+Because both prediction and ground truth come from the same speaker, the loss is phonetically valid. The content and context clips are **always different utterances** — `dataset.py` excludes the content index from the pool of context candidates — so the decoder cannot reconstruct `audio_content` by copying its timbre from context; it must learn to extract timbre from `C`.
 
 At **inference time** the roles switch to the intended conversion task:
 
@@ -182,7 +187,7 @@ content + C   ──→  [CrossAttention + Decoder]  ──→  converted mel
 
 ### Why HuBERT makes this work
 
-HuBERT is pre-trained with a masked-prediction objective on large-scale speech, so its internal representations correlate with phonemes more than with speaker acoustics. Feeding `target_audio` through HuBERT produces features that carry the *content* of the utterance while discarding much of the speaker-specific spectral shape. Without that bottleneck the model could learn to copy the input and ignore `C` entirely.
+HuBERT is pre-trained with a masked-prediction objective on large-scale speech, so its internal representations correlate with phonemes more than with speaker acoustics. Feeding `audio_content` through HuBERT produces features that carry the *content* of the utterance while discarding much of the speaker-specific spectral shape. Without that bottleneck the model could learn to copy the input and ignore `C` entirely.
 
 ### Copy-synthesis risk
 
@@ -193,8 +198,11 @@ HuBERT layer-6 features are not perfectly speaker-agnostic — some identity lea
 **Mitigation 1 — HuBERT Instance Normalization:**
 The content encoder applies `F.instance_norm` to HuBERT features before the F0 concat. It normalises each `(sample, channel)` pair to mean=0 / std=1 across the time dimension, stripping the per-sample spectral bias that encodes speaker timbre. This is a hard constraint: the model *cannot* reconstruct speaker identity from content features alone and must consult `C` via cross-attention. See the Implementation Notes for technical details.
 
-**Mitigation 2 — Random Pitch Perturbation + F0 Feature Shifting:**
-Each training batch, the audio fed to the content encoder is pitch-shifted by a random amount uniformly sampled from **±6 semitones** using `torchaudio.functional.pitch_shift`. The target mel is computed from the **original, unshifted audio** — so the model cannot copy pitch from the content features and must recover the correct pitch from `C`.
+**Mitigation 2 — Content Dropout (Information Bottleneck):**
+After the content encoder, `F.dropout(content, p=0.2, training=model.training)` randomly zeros 20% of HuBERT feature dimensions each training step. This prevents the decoder from relying on any single feature dimension that happens to carry residual speaker identity — it must use `C` to fill in the missing information. Dropout is automatically disabled during validation (`model.training = False`), so it does not affect the loss metric or audio sample quality at checkpoints.
+
+**Mitigation 3 — Random Pitch Perturbation + F0 Feature Shifting:**
+Each training batch, the audio fed to the content encoder is pitch-shifted by a random amount uniformly sampled from **±2 semitones** (probability 0.3) using `torchaudio.functional.pitch_shift`. The target mel is computed from the **original, unshifted audio** — so the model cannot copy pitch from the content features and must recover the correct pitch from `C`.
 
 To complement this, the F0 feature inside the content encoder is corrected back to the original pitch range via `f0_stats=(0.0, ratio, 0.0, 1.0)` where `ratio = 2^(n_steps/12)`. This applies the transform `f0_feature = f0_shifted / ratio = f0_original` with no extra crepe pass, making training consistent with the F0-shifting behaviour used at inference.
 
@@ -306,10 +314,10 @@ loader = DataLoader(ds, batch_size=8, collate_fn=collate_fn, shuffle=True)
 
 batch = next(iter(loader))
 print(batch["source_audio"].shape)   # [B, T_src]  — zero-padded to batch max
-print(batch["target_audio"].shape)   # [B, T_tgt]  — zero-padded to batch max
+print(batch["audio_content"].shape)  # [B, T_content] — target speaker content clip
 print(batch["context_mels"].shape)   # [B, N_CTX, 100, T_ctx]
 print(batch["source_lengths"])       # list[B]: unpadded sample count per source
-print(batch["target_lengths"])       # list[B]: unpadded sample count per target
+print(batch["content_lengths"])      # list[B]: unpadded sample count per content clip
 print(batch["ctx_mel_lens"])         # list[B] of list[N_CTX]: unpadded T per ref mel
 ```
 
@@ -331,7 +339,7 @@ The script is **safe to interrupt and resume** — files with an existing `.pt` 
 **How it works:**
 
 1. Recursively finds all `.wav`/`.flac`/`.mp3`/`.ogg` files under `--data-root`
-2. Loads waveforms on the CPU with `torchaudio.load` (8 workers, pin_memory)
+2. Loads waveforms on the CPU with `soundfile.read` (8 workers, pin_memory)
 3. Pads variable-length waveforms to the batch maximum
 4. Resamples to 24 kHz and applies `MelSpectrogram` on the GPU in a single batched pass
 5. Trims padding from each mel, applies `log(mel.clamp(1e-5))`, saves as `.pt` next to the source file
@@ -376,7 +384,7 @@ To resume training from the last checkpoint, just run `python train.py` again �
 
 ### Training log CSV
 
-Every 100 steps, a row is appended to `checkpoints/training_log.csv`:
+Every 50 steps (`CSV_LOG_EVERY`), a row is appended to `checkpoints/training_log.csv`:
 
 | Column | Description |
 |---|---|
@@ -425,8 +433,8 @@ Every `SAVE_EVERY` steps, validation saves three WAV files to `checkpoints/sampl
 Key constants at the top of `train.py`:
 
 ```python
-BATCH_SIZE    = 40       # physical batch per GPU step
-GRAD_ACCUM    = 1        # effective batch = BATCH_SIZE × GRAD_ACCUM
+BATCH_SIZE    = 32       # physical batch per GPU step
+GRAD_ACCUM    = 2        # effective batch = BATCH_SIZE × GRAD_ACCUM = 64
 MAX_AUDIO_SEC = 8.0      # clip length — increase to use more VRAM
 MAX_STEPS     = 100_000
 LR            = 1e-4
@@ -473,7 +481,7 @@ Microphone  →  mic_queue  →  Inference thread  →  Jitter buffer  →  Spea
 |---|---|
 | Mic accumulation (2 560 samples) | ~160 ms |
 | GPU inference (DFN3 + HuBERT + decode + vocoder) | ~25 ms |
-| Jitter buffer pre-fill (5 chunks) | ~256 ms |
+| Jitter buffer pre-fill (5 chunks) | ~320 ms |
 | **Total steady-state** | **~210 ms** |
 
 `PROC_SAMPLES` must be a multiple of **2 560** to avoid fractional Vocos mel frames (see *Streaming chunk size constraint* in Implementation Notes). Vocos outputs at 24 kHz; the processing thread resamples back to 16 kHz for playback so you can use a standard 16 kHz output device.
@@ -576,7 +584,7 @@ In streaming mode the DFN GRU must only advance over **new** audio. `mic_convert
 `convert.py` and `mic_convert.py` load audio with `soundfile.read()` directly. Recent versions of torchaudio default to `torchcodec` as the backend, which is not installed in this environment. `soundfile` natively handles WAV, FLAC, OGG, and AIFF without any codec dependency. `dataset.py` has always used `soundfile`; the inference scripts were updated to match.
 
 **Pitch perturbation training augmentation**
-Each training batch, the audio fed to the content encoder is pitch-shifted by a random `n_steps ∈ Uniform(−6, +6)` semitones using `torchaudio.functional.pitch_shift` (phase vocoder, runs in float32 on GPU). The target mel is computed from the **original** audio. This prevents copy-synthesis: the model cannot read the correct pitch from content features and must recover it from `C`.
+With probability 0.3 each training batch, the audio fed to the content encoder is pitch-shifted by a random `n_steps ∈ Uniform(−2, +2)` semitones using `torchaudio.functional.pitch_shift` (phase vocoder, runs in float32 on GPU). The target mel is computed from the **original** audio. This prevents copy-synthesis: the model cannot read the correct pitch from content features and must recover it from `C`.
 
 The F0 feature inside the content encoder is then corrected via `f0_stats=(0.0, ratio, 0.0, 1.0)` where `ratio = 2^(n_steps/12)`, which applies `f0_feature = f0_shifted / ratio ≈ f0_original` — no extra crepe inference required. This keeps training consistent with the F0 Z-score shifting applied at inference.
 
@@ -605,11 +613,14 @@ Unvoiced frames (f0 == 0) are left unchanged. This shifts the source speaker's p
 **Context encoder — no positional encoding, no mean pooling**
 Speaker identity (timbre, vocal tract shape) is time-invariant. Absolute positional encoding was removed so the model cannot overfit on the temporal position of phonemes in the reference clip. Mean pooling was also removed: `ContextEncoder` now outputs a full sequence `[B, T_ctx, 256]` so `CrossAttentionFusion` can attend over all reference frames (TNP style) rather than collapsing to a single vector where softmax over one key is always 1.0.
 
-**Masked L1 loss**
-The training loss is computed only over valid (non-padded) mel frames. `collate_fn` returns `target_lengths` (original audio sample counts); the training loop converts these to mel frame counts and builds a boolean mask before calling `F.l1_loss(..., reduction="none")`. Padding regions contain `log(1e-5) ≈ −11.5` and would otherwise waste model capacity if included in the loss.
+**Content dropout — information bottleneck**
+After the frozen content encoder and before cross-attention, the training loop applies `F.dropout(content, p=0.2, training=model.training)`. This zeros 20% of HuBERT feature dimensions per step, preventing the decoder from relying on any residual speaker-identity signal in the content features. Because `model.training` is `False` during `_validate()`, dropout is a no-op at eval time and does not affect the logged validation loss or checkpoint audio samples.
 
-**Batch padding and source/target lengths**
-`collate_fn` zero-pads `source_audio` and `target_audio` to the batch maximum length. Both `source_lengths` and `target_lengths` are returned alongside the padded tensors so callers can recover the unpadded region. When saving validation audio samples, `source[0, :source_lengths[0]]` and `target[0, :target_lengths[0]]` are used — feeding the full padded tensor (including zero-padding) into HuBERT causes garbage features for the silent tail, producing silence in the converted output after the real audio ends.
+**Masked L1 loss**
+The training loss is computed only over valid (non-padded) mel frames. `collate_fn` returns `content_lengths` (original audio sample counts for the content clip); the training loop converts these to mel frame counts and builds a boolean mask before calling `F.l1_loss(..., reduction="none")`. Padding regions contain `log(1e-5) ≈ −11.5` and would otherwise waste model capacity if included in the loss.
+
+**Batch padding and lengths**
+`collate_fn` zero-pads `source_audio` and `audio_content` to the batch maximum length. `source_lengths` and `content_lengths` are returned alongside the padded tensors so callers can recover the unpadded region. When saving validation audio samples, `source[0, :source_lengths[0]]` and `content_audio[0, :content_lengths[0]]` are used — feeding the full padded tensor (including zero-padding) into HuBERT causes garbage features for the silent tail, producing silence in the converted output after the real audio ends.
 
 **Vocos input format**
 The decoder outputs `[B, T_mel, 100]` (channels-last). Vocos expects `[B, 100, T_mel]` (channels-first). Always transpose before calling the vocoder: `vocoder(mel.transpose(1, 2))`.
@@ -703,7 +714,7 @@ from dataset import SpeakerDataset
 ds = SpeakerDataset("datasets/VCTK-Corpus-0.92/wav48_silence_trimmed", split="train")
 s  = ds[0]
 print("source_audio:", s["source_audio"].shape)
-print("target_audio:", s["target_audio"].shape)
+print("audio_content:", s["audio_content"].shape)
 print("context_mels:", s["context_mels"].shape)   # [N_CTX, 100, T_ctx]
 print("ctx_mel_lens:", s["ctx_mel_lens"])          # list[N_CTX] of ints
 EOF

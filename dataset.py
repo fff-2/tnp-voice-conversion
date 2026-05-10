@@ -38,7 +38,7 @@ class SpeakerDataset(Dataset):
 
     Each __getitem__ returns:
         source_audio   [T_src]             source speaker waveform @ 16 kHz
-        target_audio   [T_tgt]             target speaker waveform @ 16 kHz
+        audio_content  [T_content]          target speaker waveform @ 16 kHz (content to reconstruct)
         context_mels   [N_CTX, N_MELS, T]  reference mels from target speaker (zero-padded)
         ctx_mel_lens   list[N_CTX]         unpadded T length of each reference mel
     """
@@ -148,9 +148,13 @@ class SpeakerDataset(Dataset):
         src_spk, tgt_spk, src_idx, tgt_idx = self.pairs[idx]
 
         source_audio = self._load(self.speakers[src_spk][src_idx])
-        target_audio = self._load(self.speakers[tgt_spk][tgt_idx])
+        # audio_content: the utterance whose content will be reconstructed.
+        # Context mels are drawn from different clips of the same speaker (see below),
+        # so the model must extract timbre from context, not copy it from content features.
+        audio_content = self._load(self.speakers[tgt_spk][tgt_idx])
 
-        # N_CTX reference utterances from target speaker (excluding tgt_idx)
+        # N_CTX reference utterances from target speaker (excluding tgt_idx so
+        # audio_content and all context clips are always different utterances)
         tgt_files = self.speakers[tgt_spk]
         ctx_indices = [i for i in range(len(tgt_files)) if i != tgt_idx]
         ctx_indices = random.sample(ctx_indices, min(self.n_ctx, len(ctx_indices)))
@@ -176,7 +180,7 @@ class SpeakerDataset(Dataset):
 
         return {
             "source_audio": source_audio,
-            "target_audio": target_audio,
+            "audio_content": audio_content,
             "context_mels": context_mels,
             "ctx_mel_lens": mel_lens,   # list[N_CTX] of ints: unpadded T per ref mel
         }
@@ -196,10 +200,10 @@ def collate_fn(batch: list[dict]) -> dict:
 
     return {
         "source_audio": pad1d([b["source_audio"] for b in batch]),
-        "target_audio": pad1d([b["target_audio"] for b in batch]),
+        "audio_content": pad1d([b["audio_content"] for b in batch]),
         "context_mels": pad_mels([b["context_mels"] for b in batch]),
         "source_lengths": [b["source_audio"].shape[0] for b in batch],
-        "target_lengths": [b["target_audio"].shape[0] for b in batch],
+        "content_lengths": [b["audio_content"].shape[0] for b in batch],
         # list[B] of list[N_CTX]: unpadded mel-frame count per reference utterance.
         # Used to build key_padding_mask for cross-attention (True = padding position).
         "ctx_mel_lens": [b["ctx_mel_lens"] for b in batch],

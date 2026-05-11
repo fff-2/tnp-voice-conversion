@@ -20,13 +20,15 @@ class CrossAttentionFusion(nn.Module):
 
     def __init__(
         self,
-        content_dim: int = 769,   # 768 HuBERT + 1 log-F0
+        hubert_dim: int = 768,
+        f0_dim: int = 1,
         d_model: int = 256,
         nhead: int = 4,
         dropout: float = 0.1,
     ) -> None:
         super().__init__()
-        self.q_proj = nn.Linear(content_dim, d_model)
+        self.hubert_proj = nn.Linear(hubert_dim, d_model)
+        self.f0_proj = nn.Linear(f0_dim, d_model)
         self.attn = nn.MultiheadAttention(
             embed_dim=d_model,
             num_heads=nhead,
@@ -58,7 +60,9 @@ class CrossAttentionFusion(nn.Module):
         Returns:
             fused:            [B, T_frames, d_model]
         """
-        Q = self.q_proj(content)           # [B, T_frames, d_model]
+        hubert_feat = content[..., :768]
+        f0_feat = content[..., 768:]
+        Q = self.hubert_proj(hubert_feat) + self.f0_proj(f0_feat) # [B, T_frames, d_model]
         attn_out, _ = self.attn(
             query=Q,
             key=C,

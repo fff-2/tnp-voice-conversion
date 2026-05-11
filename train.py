@@ -247,19 +247,6 @@ def train(args) -> None:
                         f0_audio_16k=content_audio
                     )  # [B, T_frames, 769]
 
-                """  # ── HuBERT Gaussia[n noise (information bottleneck) ────────────
-                # Additive noise perturbs features without zeroing entire channels.
-                # F0 (last dim) is left intact so pitch correction is preserved.
-                hubert_feat = content[..., :768]  # [B, T_frames, 768]
-                f0_feat = content[..., 768:]  # [B, T_frames, 1]
-                if model.training:
-                    hubert_feat = (
-                        hubert_feat + torch.randn_like(hubert_feat) * HUBERT_NOISE_STD
-                    )
-                content = torch.cat(
-                    [hubert_feat, f0_feat], dim=-1
-                )  # [B, T_frames, 769] """
-
                 # ── Cross-attention + decode ──────────────────────────────────
                 fused = model.cross_attention(
                     content, C, key_padding_mask=ctx_mask

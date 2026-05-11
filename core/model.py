@@ -43,7 +43,8 @@ class VoiceConversionModel(nn.Module):
             dim_feedforward=1024,
         )
         self.cross_attention = CrossAttentionFusion(
-            content_dim=769,    # 768 HuBERT + 1 F0
+            hubert_dim=768,
+            f0_dim=1,
             d_model=self.D_MODEL,
             nhead=4,
         )

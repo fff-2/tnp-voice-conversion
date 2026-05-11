@@ -76,7 +76,7 @@ voice/
 │   ├── modules/
 │   │   ├── context_encoder.py  # Transformer, no PE/mean-pool → μ, log σ² → z [B, T_ctx, 256]
 │   │   ├── content_encoder.py  # DeepFilterNet3 + HuBERT (InstanceNorm) + torchcrepe F0
-│   │   ├── cross_attention.py  # Q=content, K/V=C, key_padding_mask
+│   │   ├── cross_attention.py  # Q=hubert_proj(h)+f0_proj(f0), K/V=C, separate projections
 │   │   └── decoder.py          # Conv1d + Transformer + 1.875× upsample → Mel [100]
 │   ├── model.py                # Full pipeline wrapper
 │   └── vocoder.py              # Vocos vocoder wrapper (frozen, 24 kHz)
@@ -112,8 +112,8 @@ SOURCE SPEAKER (live mic / audio file)
         │
         ▼
 ┌─────────────────────┐
-│  Cross-Attention    │  Q=content, K=V=C sequence (TNP style)
-│    (Trainable)      │  each content frame attends over all T_ctx ref frames
+│  Cross-Attention    │  Q = hubert_proj(h) + f0_proj(f0), K=V=C (TNP style)
+│    (Trainable)      │  separate projections balance HuBERT and F0 signal magnitudes
 └─────────────────────┘
         │
         ▼
@@ -135,7 +135,7 @@ SOURCE SPEAKER (live mic / audio file)
 | Module | Trainable | Parameters |
 |---|---|---|
 | ContextEncoder (Transformer + μ/log σ² heads) | Yes | ~3.3 M |
-| CrossAttentionFusion | Yes | ~1.0 M |
+| CrossAttentionFusion (hubert_proj + f0_proj + MHA + FFN) | Yes | ~1.0 M |
 | MelDecoder | Yes | ~2.6 M |
 | ContentEncoder (DFN3 + HuBERT + crepe) | No | ~122 M |
 | VocosVocoder | No | ~13.4 M |
@@ -531,7 +531,7 @@ Microphone  →  mic_queue  →  Inference thread  →  Jitter buffer  →  Spea
 
 </details>
 
----python convert.py --source me.wav --reference alice.wav --output converted.wav
+---
 
 ## Offline Inference — `convert.py`
 
@@ -630,7 +630,7 @@ In streaming mode the DFN GRU must only advance over **new** audio. `mic_convert
 `preprocess.py` Phase 1 generates `<stem>_aug.pt` — a 16-kHz audio tensor produced by Praat's *Change gender* algorithm with randomised pitch and formant ratios. Pitch direction (up or down) and formant direction are sampled independently so the combination covers a wide range of voice characteristics. The augmented tensor is stored once and loaded by `dataset.py` at training time, avoiding the cost of running Parselmouth or `torchaudio.functional.pitch_shift` inside the training loop. If `_aug.pt` is missing for a given file, `_load_aug()` silently falls back to clean audio.
 
 **F0 log scaling and cross-speaker Z-score shift**
-Raw F0 from torchcrepe spans `[0, 2006]` Hz while HuBERT features fall roughly in `[-3, +3]`. `torch.log1p(f0)` maps F0 to `[0, ~7.6]`, preventing it from dominating the linear projection.
+Raw F0 from torchcrepe spans `[0, 2006]` Hz while HuBERT features fall roughly in `[-3, +3]`. `torch.log1p(f0)` maps F0 to `[0, ~7.6]` before it is passed to `f0_proj`.
 
 `ContentEncoder.forward()` accepts an optional `f0_stats=(src_mean, src_std, tgt_mean, tgt_std)` tuple. When provided, voiced frames (f0 > 0) are Z-score shifted before `log1p`:
 ```python
@@ -646,9 +646,20 @@ Unvoiced frames (f0 == 0) are left unchanged. This shifts the source speaker's p
 - **Training `_validate` samples** — extracted from the unpadded source and target audio of the first validation batch item; applied only to the `converted.wav` sample, not to the loss computation.
 
 **F0 routing — Training vs Inference**
-To prevent the decoder from ignoring F0 inputs, it must receive the exact target pitch during training. `ContentEncoder.forward()` accepts an `f0_audio_16k` argument. 
+To prevent the decoder from ignoring F0 inputs, it must receive the exact target pitch during training. `ContentEncoder.forward()` accepts an `f0_audio_16k` argument.
 - *Training*: `f0_audio_16k` is set to the clean target audio (`audio_content`). The model routes the *true* pitch contour to the decoder without any math, teaching the decoder to trust and trace the F0 harmonics sharply.
 - *Inference*: The target audio doesn't exist yet, so `f0_audio_16k` is omitted. The F0 is extracted from the source audio and mathematically shifted using the `f0_stats` Z-score calculation to match the target speaker's range. From the decoder's perspective, both pipelines provide a perfectly valid target pitch contour.
+
+**Separate HuBERT / F0 projection in CrossAttentionFusion (Signal Drowning Fix)**
+The content vector fed to `CrossAttentionFusion` has shape `[B, T_frames, 769]` — 768 HuBERT channels followed by 1 log-F0 channel. A naïve single `nn.Linear(769, d_model)` projection applies the same Xavier initialisation variance (`~1/769`) to all 769 inputs. Because HuBERT contributes 768 columns while F0 contributes only 1, the total output variance driven by HuBERT is **768× larger** than the F0 signal at step 0 — the F0 is effectively drowned out, and the model converges to a blurry local minimum that ignores pitch entirely.
+
+To fix this, the projection is split into two independent heads:
+```python
+self.hubert_proj = nn.Linear(768, d_model)   # variance ∝ 1/768
+self.f0_proj     = nn.Linear(1,   d_model)   # variance ∝ 1/1  ← 768× larger weights
+Q = self.hubert_proj(content[..., :768]) + self.f0_proj(content[..., 768:])
+```
+The `f0_proj` fan-in of 1 means its weights are initialised ~28× larger in magnitude, amplifying the F0 signal to match the aggregate HuBERT signal power. The final expressible function is mathematically identical to a single `nn.Linear(769, d_model)` with manually set row-wise variances — but the split makes the initialisation automatic and PyTorch-idiomatic. This matches the approach used in RVC, VITS, and FastSpeech 2.
 
 **F0 decoder — argmax, not Viterbi**
 `torchcrepe` is configured with `decoder=torchcrepe.decode.argmax`. Viterbi is a global dynamic-programming algorithm that requires the full sequence and is incompatible with chunk-by-chunk streaming. Argmax is frame-independent and causal.

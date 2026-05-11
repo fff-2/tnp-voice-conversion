@@ -42,9 +42,9 @@ VOCODER_SR = 24_000  # mel computation and vocoder output sample rate
 BATCH_SIZE = 32  # physical batch per GPU step — increase to fill VRAM
 GRAD_ACCUM = 2  # effective batch = BATCH_SIZE * GRAD_ACCUM = 32
 MAX_STEPS = 100_000
-SAVE_EVERY = 1
-LOG_EVERY = 1
-CSV_LOG_EVERY = 1
+SAVE_EVERY = 1000
+LOG_EVERY = 50
+CSV_LOG_EVERY = 50
 WARMUP_STEPS = 1_000
 LR = 1e-4
 WEIGHT_DECAY = 1e-2

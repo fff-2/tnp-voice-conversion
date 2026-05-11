@@ -80,8 +80,7 @@ def get_beta(step: int) -> float:
         return 0.0
     if step >= KL_ANNEAL_END:
         return KL_BETA_MAX
-    # return KL_BETA_MAX * (step - KL_ANNEAL_START) / (KL_ANNEAL_END - KL_ANNEAL_START)
-    return 0.0001
+    return KL_BETA_MAX * (step - KL_ANNEAL_START) / (KL_ANNEAL_END - KL_ANNEAL_START)
 
 
 # ── Training loop ─────────────────────────────────────────────────────────────

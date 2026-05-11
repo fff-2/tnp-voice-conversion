@@ -155,21 +155,25 @@ VCTK and LibriSpeech are **non-parallel**: each speaker says different sentences
 
 The training loop uses a **self-reconstruction** objective to sidestep the parallel-data problem. For each training sample, one speaker and one utterance are selected:
 
-- `source_audio` — the **Parselmouth-augmented** version of the utterance (pitch + formant shifted). Fed into the content encoder.
-- `audio_content` — the **clean** version of the same utterance. Used as the mel reconstruction target.
+- `source_audio` — the **Parselmouth-augmented** version of the utterance (pitch + formant shifted). Used to extract **phonetic content** (HuBERT).
+- `audio_content` — the **clean** version of the same utterance. Used to extract the **true pitch contour** (F0) and as the mel reconstruction target.
 - `context_mels` — N_CTX=5 **clean** reference utterances from the same speaker (always different clips).
 
 ```
 Training forward pass
 ─────────────────────────────────────────────────────────────────────
-source_audio   ──→  [ContentEncoder (frozen)]  ──→  content features
-  (augmented)       (HuBERT + InstanceNorm strips per-sample timbre)
+source_audio   ──→  [ContentEncoder: HuBERT]  ──→  phonetic features
+  (augmented)       (InstanceNorm strips per-sample timbre)
+
+audio_content  ──→  [ContentEncoder: Crepe]   ──→  F0 (true pitch contour)
+  (clean)
 
 context_mels   ──→  [ContextEncoder Transformer]
   (clean)           ──→  μ [B, T_ctx, 256],  log σ² [B, T_ctx, 256]
                     ──→  z = μ + ε·σ,  ε ~ N(0, I)   ← reparameterization trick
 
-content + z    ──→  [CrossAttention + Decoder]  ──→  pred_mel
+phonetics + F0 ──→  [CrossAttention + Decoder]  ──→  pred_mel
+   + z (Context)
 
 ELBO loss:  L1( pred_mel,  mel(audio_content) )          ← reconstruction
           + β · KL( q(z|C) || N(0,I) )                  ← KL divergence
@@ -203,7 +207,7 @@ HuBERT layer-6 features are not perfectly speaker-agnostic — some identity lea
 The content encoder applies `F.instance_norm` to HuBERT features before the F0 concat. It normalises each `(sample, channel)` pair to mean=0 / std=1 across the time dimension, stripping the per-sample spectral bias that encodes speaker timbre. This is a hard constraint: the model *cannot* reconstruct speaker identity from content features alone and must consult `C` via cross-attention. See the Implementation Notes for technical details.
 
 **Mitigation 2 — Offline Pitch + Formant Augmentation:**
-`preprocess.py` pre-generates one Parselmouth-augmented variant per audio file (`_aug.pt`). Pitch and formant shift directions are sampled independently at random: pitch `Uniform(1.10, 1.30)` or `Uniform(0.70, 0.90)`; formant `Uniform(1.05, 1.15)` or `Uniform(0.85, 0.95)`. During training, the augmented audio is fed into the content encoder while the clean audio is used as the reconstruction target. The pitch shift forces the model to recover the correct pitch from context `z` rather than copying it from content features; the formant shift alters the vocal tract shape, making it harder to extract speaker identity from the content stream.
+`preprocess.py` pre-generates one Parselmouth-augmented variant per audio file (`_aug.pt`). Pitch and formant shift directions are sampled independently at random: pitch `Uniform(1.10, 1.30)` or `Uniform(0.70, 0.90)`; formant `Uniform(1.05, 1.15)` or `Uniform(0.85, 0.95)`. During training, this augmented audio is fed into the HuBERT content encoder. The aggressive pitch and formant shifts alter the vocal tract shape and fundamental frequency, effectively destroying the speaker identity in the source audio so it doesn't leak through the HuBERT features. Meanwhile, the *true* pitch contour is extracted from the clean target audio (`audio_content`) and provided directly to the decoder. This ensures the decoder learns to perfectly respect the F0 input (instead of blurring the pitch to minimize L1 error), while still being forced to rely entirely on `z` for the speaker's vocal tract and timbre.
 
 **Mitigation 3 — Variational KL Bottleneck (Stochastic TNP):**
 The context encoder applies a variational bottleneck after its Transformer layers. Instead of producing a single deterministic representation, it outputs `μ` and `log σ²` (each `[B, T_ctx, 256]`) and samples `z = μ + ε·σ` via the reparameterization trick. The ELBO adds a KL divergence penalty between `q(z|C) = N(μ, σ²)` and the isotropic prior `p(z) = N(0, I)`:
@@ -640,6 +644,11 @@ Unvoiced frames (f0 == 0) are left unchanged. This shifts the source speaker's p
 - **`convert.py`** — extracted from source and concatenated reference audio once before the chunk loop; applied to every chunk.
 - **`mic_convert.py`** — target stats extracted from reference at startup; source stats tracked via EMA over the streaming session, applied after `STATS_WARMUP=15` chunks.
 - **Training `_validate` samples** — extracted from the unpadded source and target audio of the first validation batch item; applied only to the `converted.wav` sample, not to the loss computation.
+
+**F0 routing — Training vs Inference**
+To prevent the decoder from ignoring F0 inputs, it must receive the exact target pitch during training. `ContentEncoder.forward()` accepts an `f0_audio_16k` argument. 
+- *Training*: `f0_audio_16k` is set to the clean target audio (`audio_content`). The model routes the *true* pitch contour to the decoder without any math, teaching the decoder to trust and trace the F0 harmonics sharply.
+- *Inference*: The target audio doesn't exist yet, so `f0_audio_16k` is omitted. The F0 is extracted from the source audio and mathematically shifted using the `f0_stats` Z-score calculation to match the target speaker's range. From the decoder's perspective, both pipelines provide a perfectly valid target pitch contour.
 
 **F0 decoder — argmax, not Viterbi**
 `torchcrepe` is configured with `decoder=torchcrepe.decode.argmax`. Viterbi is a global dynamic-programming algorithm that requires the full sequence and is incompatible with chunk-by-chunk streaming. Argmax is frame-independent and causal.

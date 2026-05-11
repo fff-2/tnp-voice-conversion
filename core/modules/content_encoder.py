@@ -154,6 +154,7 @@ class ContentEncoder(nn.Module):
         skip_denoise: bool = False,
         hubert_stats: tuple | None = None,
         f0_stats: tuple | None = None,
+        f0_audio_16k: Tensor | None = None,
     ) -> Tensor:
         """
         Full content encoding pipeline.
@@ -182,7 +183,11 @@ class ContentEncoder(nn.Module):
         hubert_feat = self._extract_hubert(audio)      # [B, T_frames, 768]
 
         # Step 3: F0
-        f0 = self._extract_f0(audio)                   # [B, T_frames, 1]
+        if f0_audio_16k is not None:
+            f0_audio = f0_audio_16k if skip_denoise else self._denoise(f0_audio_16k)
+            f0 = self._extract_f0(f0_audio)
+        else:
+            f0 = self._extract_f0(audio)                   # [B, T_frames, 1]
 
         # Align lengths (HuBERT and crepe may differ by 1 frame at chunk edges)
         T = min(hubert_feat.shape[1], f0.shape[1])

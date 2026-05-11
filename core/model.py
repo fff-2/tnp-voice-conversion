@@ -112,7 +112,7 @@ class VoiceConversionModel(nn.Module):
     ) -> tuple:
         """Returns (pred_mel, target_mel, mu, log_var) for ELBO training."""
         z, mu, log_var = self.context_encoder(context_mel)
-        content = self.content_encoder(source_audio)
+        content = self.content_encoder(source_audio, f0_audio_16k=target_audio)
         fused = self.cross_attention(content, z, key_padding_mask=ctx_mask)
         pred_mel = self.decoder(fused)
         target_mel = self._compute_mel(target_audio)

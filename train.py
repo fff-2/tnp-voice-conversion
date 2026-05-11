@@ -242,7 +242,10 @@ def train(args) -> None:
                 # utterance.  The model must rely on clean context C to recover
                 # speaker identity rather than copying it from content features.
                 with torch.no_grad():
-                    content = model.content_encoder(source_audio)  # [B, T_frames, 769]
+                    content = model.content_encoder(
+                        source_audio,
+                        f0_audio_16k=content_audio
+                    )  # [B, T_frames, 769]
 
                 """  # ── HuBERT Gaussia[n noise (information bottleneck) ────────────
                 # Additive noise perturbs features without zeroing entire channels.

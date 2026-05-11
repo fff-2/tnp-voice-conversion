@@ -2,7 +2,7 @@
 
 Few-shot, real-time voice conversion. Record a few seconds of a target speaker — the system converts your live microphone input into that voice with low latency.
 
-**Architecture:** Variational Temporal Neural Process — the context encoder outputs a stochastic latent sequence `z ~ q(z|C) = N(μ, σ²)` trained with an ELBO (masked L1 reconstruction + KL divergence). At inference `z = μ`, fully deterministic and stable for streaming.
+**Architecture:** Variational Transformer Neural Process — the context encoder outputs a stochastic latent sequence `z ~ q(z|C) = N(μ, σ²)` trained with an ELBO (masked L1 reconstruction + KL divergence). At inference `z = μ`, fully deterministic and stable for streaming.
 
 ---
 
@@ -68,6 +68,7 @@ voice/
 │   ├── latest.pt
 │   └── samples/step_N/         # Qualitative audio saved every SAVE_EVERY steps
 │       ├── source.wav
+│       ├── context.wav      
 │       ├── target.wav
 │       └── converted.wav
 │
@@ -358,6 +359,8 @@ For every audio file, one pitch+formant-shifted variant is created with Praat's 
 p225_001_mic1.flac  →  p225_001_mic1_aug.pt   (float32 tensor, 16 kHz)
 ```
 
+This process is CPU-bound and automatically runs in parallel across multiple CPU cores using a `ProcessPoolExecutor`. You can control the number of parallel processes using the `--num-workers` flag.
+
 The shift direction for pitch and formant is sampled independently and at random:
 
 | Parameter | High direction | Low direction |
@@ -382,7 +385,7 @@ Computing mel spectrograms on the CPU inside the DataLoader is the primary bottl
 |---|---|---|
 | `--data-root` | *(required)* | Root directory of audio files |
 | `--batch-size` | `32` | GPU batch size for Phase 2 — increase to fill VRAM |
-| `--num-workers` | `8` | DataLoader CPU worker count for Phase 2 |
+| `--num-workers` | `8` | CPU worker count for Phase 1 (augmentation) and Phase 2 (DataLoader) |
 | `--seed` | `42` | RNG seed for augmentation direction sampling |
 | `--skip-aug` | off | Skip Phase 1 and run mel cache only |
 
@@ -444,12 +447,13 @@ df.plot(x="step", y=["train_loss", "val_loss"])
 
 ### Qualitative audio samples
 
-Every `SAVE_EVERY` steps, validation saves three WAV files to `checkpoints/samples/step_{N}/`:
+Every `SAVE_EVERY` steps, validation saves four WAV files to `checkpoints/samples/step_{N}/`:
 
 | File | Content |
 |---|---|
 | `source.wav` | Augmented source audio from the first validation batch (16 kHz) |
 | `target.wav` | Clean audio content from the first validation batch (16 kHz) |
+| `context.wav`| First clean reference context clip used for speaker conditioning, decoded through Vocos (24 kHz) |
 | `converted.wav` | Augmented source content + clean context C, decoded through Vocos (24 kHz) |
 
 `converted.wav` mirrors the training path: augmented audio into the content encoder, clean context clips as speaker reference. Use it to track how well the model reconstructs clean speech from perturbed input. With F0 shifting applied, the converted output should match the clean target's pitch register.

@@ -1,8 +1,8 @@
-# Real-Time Deterministic Voice Conversion Pipeline
+# Real-Time Voice Conversion Pipeline — Variational TNP
 
 Few-shot, real-time voice conversion. Record a few seconds of a target speaker — the system converts your live microphone input into that voice with low latency.
 
-**Architecture:** Deterministic attention-based conditioning — no VAEs, no probabilistic sampling, fully stable for streaming.
+**Architecture:** Variational Temporal Neural Process — the context encoder outputs a stochastic latent sequence `z ~ q(z|C) = N(μ, σ²)` trained with an ELBO (masked L1 reconstruction + KL divergence). At inference `z = μ`, fully deterministic and stable for streaming.
 
 ---
 
@@ -73,7 +73,7 @@ voice/
 │
 ├── core/
 │   ├── modules/
-│   │   ├── context_encoder.py  # Transformer, no PE/mean-pool → C [B, T_ctx, 256]
+│   │   ├── context_encoder.py  # Transformer, no PE/mean-pool → μ, log σ² → z [B, T_ctx, 256]
 │   │   ├── content_encoder.py  # DeepFilterNet3 + HuBERT (InstanceNorm) + torchcrepe F0
 │   │   ├── cross_attention.py  # Q=content, K/V=C, key_padding_mask
 │   │   └── decoder.py          # Conv1d + Transformer + 1.875× upsample → Mel [100]
@@ -96,9 +96,10 @@ TARGET SPEAKER (reference audio)
         ▼
 ┌─────────────────────┐
 │   Context Encoder   │  Transformer (4 layers), no positional encoding
-│     (Trainable)     │  [B, 100, T_ctx] → C [B, T_ctx, 256]
+│     (Trainable)     │  [B, 100, T_ctx] → μ, log σ² → z [B, T_ctx, 256]
+│                     │  (training: z sampled; inference: z = μ, deterministic)
 └─────────────────────┘
-        │  C (computed once, cached per speaker)
+        │  z (computed once, cached per speaker)
         ▼
 SOURCE SPEAKER (live mic / audio file)
         │
@@ -132,12 +133,12 @@ SOURCE SPEAKER (live mic / audio file)
 
 | Module | Trainable | Parameters |
 |---|---|---|
-| ContextEncoder | Yes | ~3.2 M |
+| ContextEncoder (Transformer + μ/log σ² heads) | Yes | ~3.5 M |
 | CrossAttentionFusion | Yes | ~1.0 M |
 | MelDecoder | Yes | ~2.6 M |
 | ContentEncoder (DFN3 + HuBERT + crepe) | No | ~122 M |
 | VocosVocoder | No | ~13.4 M |
-| **Total trainable** | | **~6.8 M (~26 MB fp32)** |
+| **Total trainable** | | **~7.1 M (~27 MB fp32)** |
 
 ---
 
@@ -162,15 +163,18 @@ Training forward pass
 audio_content  ──→  [ContentEncoder (frozen)]  ──→  content features
                          (HuBERT discards speaker acoustics,
                           preserves phonetics)
-                    ──→  HuBERT spatial dropout1d (p=0.1)  ──→  masked features
+                    ──→  HuBERT spatial dropout1d (p=0.3)  ──→  masked features
                          (F0 channel bypasses dropout)
 
-context_mels   ──→  [ContextEncoder]  ──→  C  (target speaker embedding)
+context_mels   ──→  [ContextEncoder Transformer]
+                    ──→  μ [B, T_ctx, 256],  log σ² [B, T_ctx, 256]
+                    ──→  z = μ + ε·σ,  ε ~ N(0, I)   ← reparameterization trick
 
-masked_content + C  ──→  [CrossAttention + Decoder]  ──→  pred_mel
+masked_content + z  ──→  [CrossAttention + Decoder]  ──→  pred_mel
 
-Loss:  L1( pred_mel,  mel(audio_content) )   ← ground truth is always
-                                                the unperturbed original
+ELBO loss:  L1( pred_mel,  mel(audio_content) )          ← reconstruction
+          + β · KL( q(z|C) || N(0,I) )                  ← KL divergence
+          β: 0 for steps 0–5000, linear ramp → 0.01 by step 20000 (KL annealing)
 ```
 
 Because both prediction and ground truth come from the same speaker, the loss is phonetically valid. The content and context clips are **always different utterances** — `dataset.py` excludes the content index from the pool of context candidates — so the decoder cannot reconstruct `audio_content` by copying its timbre from context; it must learn to extract timbre from `C`.
@@ -203,9 +207,20 @@ The content encoder applies `F.instance_norm` to HuBERT features before the F0 c
 After the content encoder, the 769-dimensional content tensor is split into HuBERT features `[B, T_frames, 768]` and F0 `[B, T_frames, 1]`. `F.dropout1d(p=0.1)` is applied to the HuBERT slice only, zeroing entire channels across all time-steps. Unlike frame-level dropout which pokes random holes in individual elements, `dropout1d` eliminates whole temporal channels — if a HuBERT channel encodes persistent speaker timbre across time, zeroing its entire time-axis removes that signal completely. The F0 channel is concatenated back unchanged, preserving the pitch correction applied by the augmentation step. Dropout is automatically disabled during validation (`model.training = False`).
 
 **Mitigation 3 — Random Pitch Perturbation + F0 Feature Shifting:**
-Each training batch, the audio fed to the content encoder is pitch-shifted by a random amount uniformly sampled from **±2 semitones** (probability 0.3) using `torchaudio.functional.pitch_shift`. The target mel is computed from the **original, unshifted audio** — so the model cannot copy pitch from the content features and must recover the correct pitch from `C`.
+Each training batch, the audio fed to the content encoder is pitch-shifted by a random amount uniformly sampled from **±4 semitones** (probability 0.3) using `torchaudio.functional.pitch_shift`. The target mel is computed from the **original, unshifted audio** — so the model cannot copy pitch from the content features and must recover the correct pitch from `z`.
 
 To complement this, the F0 feature inside the content encoder is corrected back to the original pitch range via `f0_stats=(0.0, ratio, 0.0, 1.0)` where `ratio = 2^(n_steps/12)`. This applies the transform `f0_feature = f0_shifted / ratio = f0_original` with no extra crepe pass, making training consistent with the F0-shifting behaviour used at inference.
+
+**Mitigation 4 — Variational KL Bottleneck (Stochastic TNP):**
+The context encoder applies a variational bottleneck after its Transformer layers. Instead of producing a single deterministic representation, it outputs `μ` and `log σ²` (each `[B, T_ctx, 256]`) and samples `z = μ + ε·σ` via the reparameterization trick. The ELBO adds a KL divergence penalty between `q(z|C) = N(μ, σ²)` and the isotropic prior `p(z) = N(0, I)`:
+
+```
+KL = -0.5 · mean( 1 + log σ² − μ² − σ² )   [closed-form, per valid frame]
+```
+
+This regularises the context representation toward the prior — the encoder cannot produce arbitrarily sharp, data-memorising embeddings. At inference `z = μ` exactly (model in `eval()` mode), so the pipeline is fully deterministic and streaming-safe. The two linear projection heads (`μ_proj`, `log σ²_proj`) are initialised as near-identity so resuming from a deterministic checkpoint causes zero disruption to learned representations on the first step.
+
+**KL Annealing** prevents posterior collapse (the encoder collapsing to the prior with `μ = 0`, `σ = 1` to zero out the KL term): β starts at 0 for the first 5 000 steps (pure reconstruction warmup), then linearly ramps to `β_max = 0.01` by step 20 000 and remains constant thereafter.
 
 ---
 
@@ -390,9 +405,11 @@ Every 50 steps (`CSV_LOG_EVERY`), a row is appended to `checkpoints/training_log
 | Column | Description |
 |---|---|
 | `step` | Optimizer step number |
-| `train_loss` | Average L1 loss over the last 50 steps |
+| `train_loss` | Average masked L1 reconstruction loss over the last 50 steps |
 | `val_loss` | Most recent validation loss (carries forward between checkpoints) |
 | `learning_rate` | Current LR after warmup / cosine schedule |
+| `kl_loss` | Average KL divergence (per valid frame-element) over the last 50 steps |
+| `beta` | Current KL annealing weight β (0 → 0.01 between steps 5 000 and 20 000) |
 
 The file is created with a header on first run and **appended** on resume — rows are never overwritten. Change the filename with `--csv-log`:
 
@@ -611,8 +628,12 @@ Unvoiced frames (f0 == 0) are left unchanged. This shifts the source speaker's p
 **F0 frame alignment**
 `torchcrepe.predict(..., hop_length=320)` and HuBERT both have a 320-sample stride, producing `T // 320` frames each. If you ever change one, change both — mismatched strides cause silent feature misalignment at concatenation.
 
-**Context encoder — no positional encoding, no mean pooling**
-Speaker identity (timbre, vocal tract shape) is time-invariant. Absolute positional encoding was removed so the model cannot overfit on the temporal position of phonemes in the reference clip. Mean pooling was also removed: `ContextEncoder` now outputs a full sequence `[B, T_ctx, 256]` so `CrossAttentionFusion` can attend over all reference frames (TNP style) rather than collapsing to a single vector where softmax over one key is always 1.0.
+**Context encoder — variational bottleneck, no positional encoding, no mean pooling**
+Speaker identity (timbre, vocal tract shape) is time-invariant. Absolute positional encoding was removed so the model cannot overfit on the temporal position of phonemes in the reference clip. Mean pooling was also removed: `ContextEncoder` outputs a full sequence so `CrossAttentionFusion` can attend over all reference frames (TNP style).
+
+After the Transformer and `LayerNorm`, two linear heads project to `μ [B, T_ctx, 256]` and `log σ² [B, T_ctx, 256]`. The sampled latent `z = μ + ε·σ` replaces the old deterministic output as the K/V sequence for cross-attention. In `eval()` mode `z = μ` — no randomness in inference. The `log σ²` output is clamped to `[-10, 4]` (σ ∈ `[0.007, 7.4]`) to prevent numerical explosion before the KL `exp()`.
+
+The two new projection heads are initialised specially to avoid disrupting a resumed checkpoint: `μ_proj` starts as an identity matrix (so `μ = x` on step 0), `log σ²_proj` starts with zero weights and bias `−5` (so `σ ≈ 0.08` — nearly no noise). The training signal immediately corrects these from the first gradient step.
 
 **HuBERT spatial dropout — information bottleneck**
 After the frozen content encoder and before cross-attention, the training loop splits the `[B, T_frames, 769]` content tensor into HuBERT features `[:, :, :768]` and F0 `[:, :, 768:]`, applies `F.dropout1d` to the HuBERT slice with `p=0.1`, then concatenates F0 back:
@@ -628,6 +649,15 @@ content = torch.cat([hubert_feat, f0_feat], dim=-1)
 
 **Masked L1 loss**
 The training loss is computed only over valid (non-padded) mel frames. `collate_fn` returns `content_lengths` (original audio sample counts for the content clip); the training loop converts these to mel frame counts and builds a boolean mask before calling `F.l1_loss(..., reduction="none")`. Padding regions contain `log(1e-5) ≈ −11.5` and would otherwise waste model capacity if included in the loss.
+
+**ELBO — KL divergence and annealing**
+The total training loss is the ELBO: `recon_loss + β · kl_loss`. The KL term is also masked — padded context positions are excluded via `~ctx_mask` before summing:
+```python
+kl_raw   = -0.5 * (1.0 + lv_f - mu_f.pow(2) - lv_f.exp())  # [B, N*T_ctx, d_model]
+valid    = (~ctx_mask).float()                                # 1 = valid, 0 = padding
+kl_loss  = (kl_raw * valid.unsqueeze(-1)).sum() / (valid.sum() * D_MODEL + 1e-8)
+```
+KL is computed in float32 (explicit `.float()` cast inside the bfloat16 autocast block) to avoid precision loss in the `exp()` call. `β = get_beta(step)` implements linear annealing: 0 for steps 0–5 000, linear ramp to 0.01 by step 20 000, constant at 0.01 thereafter. Both `recon_loss` and the KL term are divided by `GRAD_ACCUM` before `.backward()` to keep gradient scale correct under accumulation.
 
 **Batch padding and lengths**
 `collate_fn` zero-pads `source_audio` and `audio_content` to the batch maximum length. `source_lengths` and `content_lengths` are returned alongside the padded tensors so callers can recover the unpadded region. When saving validation audio samples, `source[0, :source_lengths[0]]` and `content_audio[0, :content_lengths[0]]` are used — feeding the full padded tensor (including zero-padding) into HuBERT causes garbage features for the silent tail, producing silence in the converted output after the real audio ends.
@@ -665,12 +695,15 @@ hubert_norm = (hubert_feat - hub_mean) / (hub_std + 1e-5)
 `mic_convert.py` maintains a per-channel EMA (`momentum=0.95`, τ ≈ 3 s) of the raw HuBERT channel statistics, updated each chunk via `content_encoder.extract_streaming_stats()`. The EMA stats are passed into `convert_chunk_streaming()` → `content_encoder.forward()` after a `STATS_WARMUP=15` chunk (~2.4 s) period, during which the pipeline falls back to per-chunk `instance_norm`.
 
 **TNP training / inference consistency**
-At inference `encode_references()` **concatenates** N reference sequences along the time axis: `torch.cat(encoded, dim=1)` → `[1, N·T_ctx, 256]`. The training loop must mirror this exactly. The old code averaged with `.mean(dim=1)` which mixed frames from completely different utterances and broke the TNP contract.
-The correct reshape is:
+At inference `encode_references()` calls `self.eval()` first (so `z = μ`, deterministic), then **concatenates** N reference sequences along the time axis: `torch.cat(encoded, dim=1)` → `[1, N·T_ctx, 256]`. The training loop mirrors this exactly — context encoder output is reshaped, not averaged:
 ```python
-# train.py
-C = C_all.view(B, N * T_ctx_enc, -1)   # [B, N·T_ctx, d_model]  ← concatenate, not mean
+# train.py — context encoder returns (z, mu, log_var), each [B*N, T_ctx, d_model]
+C_all, mu_all, lv_all = model.context_encoder(ctx_flat, src_key_padding_mask=ctx_enc_mask)
+C    = C_all.view(B, N * T_ctx_enc, -1)   # [B, N·T_ctx, d_model]  ← concatenate, not mean
+mu_C = mu_all.view(B, N * T_ctx_enc, -1)  # for KL computation
+lv_C = lv_all.view(B, N * T_ctx_enc, -1)
 ```
+During validation the model is in `eval()`, so `z = μ` and `_validate()` discards `mu_all`/`lv_all` with `C_all, _, _ = ...`.
 
 **Two separate padding masks for context — self-attention and cross-attention**
 Context mels are zero-padded in two places: within `__getitem__` (different mels padded to the item-level maximum T) and in `collate_fn` (items padded to the batch-level maximum T). Padding must be excluded from *both* the context encoder's self-attention and the cross-attention fusion. These require masks of different shapes and must be built separately.
@@ -711,10 +744,21 @@ python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_
 python - <<'EOF'
 import torch
 from core.model import VoiceConversionModel
+from core.modules.context_encoder import ContextEncoder
+
 m     = VoiceConversionModel(torch.device("cuda"))
 audio = torch.randn(1, 3200).cuda()
-C     = torch.randn(1, 750, 256).cuda()   # [1, T_ctx, D_MODEL] context sequence
-out   = m.convert_chunk(audio, C)
+
+# Variational context encoder: forward() returns (z, mu, log_var)
+enc  = ContextEncoder().cuda().eval()
+mel  = torch.randn(1, 100, 150).cuda()
+z, mu, lv = enc(mel)
+print("z shape:", z.shape)          # [1, 150, 256]
+print("z == mu at eval:", torch.allclose(z, mu))   # True
+
+# Full pipeline via pre-cached context
+C   = torch.randn(1, 750, 256).cuda()   # [1, T_ctx, D_MODEL]
+out = m.convert_chunk(audio, C)
 print("Output shape:", out.shape)   # [1, 1, T_wav @ 24 kHz]
 EOF
 

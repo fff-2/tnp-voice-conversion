@@ -53,6 +53,13 @@ MAX_AUDIO_SEC = 8.0  # longer clips → more HuBERT activations → more VRAM
 N_CTX = 5  # number of context utterances per training sample
 N_MELS = 100
 
+# ── KL annealing schedule ──────────────────────────────────────────────────────
+# beta=0 for the first KL_ANNEAL_START steps (pure reconstruction warmup),
+# then linearly ramps to KL_BETA_MAX by KL_ANNEAL_END.  Prevents posterior collapse.
+KL_ANNEAL_START = 5_000
+KL_ANNEAL_END = 20_000
+KL_BETA_MAX = 0.01
+
 
 # ── LR schedule: linear warmup → cosine decay ────────────────────────────────
 
@@ -62,6 +69,15 @@ def get_lr(step: int, warmup: int, max_steps: int, base_lr: float) -> float:
         return base_lr * step / max(1, warmup)
     progress = (step - warmup) / max(1, max_steps - warmup)
     return base_lr * 0.5 * (1.0 + np.cos(np.pi * progress))
+
+
+def get_beta(step: int) -> float:
+    """Linear KL annealing: 0 → KL_BETA_MAX over [KL_ANNEAL_START, KL_ANNEAL_END]."""
+    if step < KL_ANNEAL_START:
+        return 0.0
+    if step >= KL_ANNEAL_END:
+        return KL_BETA_MAX
+    return KL_BETA_MAX * (step - KL_ANNEAL_START) / (KL_ANNEAL_END - KL_ANNEAL_START)
 
 
 # ── Training loop ─────────────────────────────────────────────────────────────
@@ -93,7 +109,9 @@ def train(args) -> None:
     csv_path = output_dir / args.csv_log
     if not csv_path.exists():
         with open(csv_path, "w", newline="") as f:
-            csv.writer(f).writerow(["step", "train_loss", "val_loss", "learning_rate"])
+            csv.writer(f).writerow(
+                ["step", "train_loss", "val_loss", "learning_rate", "kl_loss", "beta"]
+            )
 
     ckpt_path = output_dir / "latest.pt"
     if ckpt_path.exists() and not args.reset:
@@ -148,6 +166,7 @@ def train(args) -> None:
     # ── Training loop ─────────────────────────────────────────────────────────
     optimizer.zero_grad()
     running_loss = 0.0
+    running_kl = 0.0
     accum_count = 0
 
     while step < MAX_STEPS:
@@ -194,13 +213,15 @@ def train(args) -> None:
                         valid = ctx_mel_lens[i][n]
                         ctx_enc_mask[i * N + n, :valid] = False
 
-                C_all = model.context_encoder(
+                C_all, mu_all, lv_all = model.context_encoder(
                     ctx_flat, src_key_padding_mask=ctx_enc_mask
-                )  # [B*N, T_ctx, d_model]
+                )  # each [B*N, T_ctx, d_model]
                 T_ctx_enc = C_all.shape[1]  # == T_ctx (no temporal stride)
                 # Concatenate N reference sequences along the time axis (TNP style),
                 # matching encode_references() used at inference.
                 C = C_all.view(B, N * T_ctx_enc, -1)  # [B, N*T_ctx, d_model]
+                mu_C = mu_all.view(B, N * T_ctx_enc, -1)  # [B, N*T_ctx, d_model]
+                lv_C = lv_all.view(B, N * T_ctx_enc, -1)  # [B, N*T_ctx, d_model]
 
                 # ── Cross-attention padding mask ──────────────────────────────
                 # True = position is zero-padding; prevents it from polluting attention.
@@ -211,6 +232,19 @@ def train(args) -> None:
                     for n in range(N):
                         valid = ctx_mel_lens[i][n]
                         ctx_mask[i, n * T_ctx_enc : n * T_ctx_enc + valid] = False
+
+                # ── KL divergence: q(z|C) vs N(0,I) ──────────────────────────
+                # Compute in float32 to avoid bfloat16 precision loss in exp().
+                # Masked so that zero-padded context positions are excluded.
+                mu_f = mu_C.float()
+                lv_f = lv_C.float()
+                kl_raw = -0.5 * (
+                    1.0 + lv_f - mu_f.pow(2) - lv_f.exp()
+                )  # [B, N*T_ctx, d_model]
+                valid_ctx = (~ctx_mask).float()  # [B, N*T_ctx]
+                kl_loss = (kl_raw * valid_ctx.unsqueeze(-1)).sum() / (
+                    valid_ctx.sum() * model.D_MODEL + 1e-8
+                )
 
                 # ── Content encoding (frozen, no grad) ────────────────────────
                 # F0 shifting undoes the pitch perturbation at feature level:
@@ -231,7 +265,7 @@ def train(args) -> None:
                 f0_feat = content[..., 768:]  # [B, T_frames, 1]
                 hubert_feat = F.dropout1d(
                     hubert_feat.transpose(1, 2),  # [B, 768, T_frames]
-                    p=0.3,
+                    p=0.05,
                     training=model.training,
                 ).transpose(1, 2)  # [B, T_frames, 768]
                 content = torch.cat(
@@ -262,13 +296,15 @@ def train(args) -> None:
                 loss_raw = F.l1_loss(
                     pred_mel[:, :T, :], tgt_mel[:, :T, :], reduction="none"
                 )
-                loss = (loss_raw * mask.unsqueeze(-1)).sum() / (
+                recon_loss = (loss_raw * mask.unsqueeze(-1)).sum() / (
                     mask.sum() * N_MELS + 1e-8
                 )
-                loss = loss / GRAD_ACCUM
+                beta = get_beta(step)
+                loss = (recon_loss + beta * kl_loss) / GRAD_ACCUM
 
             loss.backward()
-            running_loss += loss.item() * GRAD_ACCUM
+            running_loss += recon_loss.item()
+            running_kl += kl_loss.item()
             accum_count += 1
 
             # ── Optimizer step every GRAD_ACCUM mini-batches ─────────────────
@@ -287,13 +323,21 @@ def train(args) -> None:
 
                 # ── Logging ───────────────────────────────────────────────────
                 if step % LOG_EVERY == 0:
-                    avg = running_loss / (LOG_EVERY * GRAD_ACCUM)
+                    avg_recon = running_loss / (LOG_EVERY * GRAD_ACCUM)
+                    avg_kl = running_kl / (LOG_EVERY * GRAD_ACCUM)
                     running_loss = 0.0
-                    logger.info(f"step={step:6d}  loss={avg:.4f}  lr={lr:.2e}")
+                    running_kl = 0.0
+                    cur_beta = get_beta(step)
+                    logger.info(
+                        f"step={step:6d}  recon={avg_recon:.4f}"
+                        f"  kl={avg_kl:.4f}  beta={cur_beta:.4f}  lr={lr:.2e}"
+                    )
 
                     if step % CSV_LOG_EVERY == 0:
                         with open(csv_path, "a", newline="") as f:
-                            csv.writer(f).writerow([step, avg, last_val_loss, lr])
+                            csv.writer(f).writerow(
+                                [step, avg_recon, last_val_loss, lr, avg_kl, cur_beta]
+                            )
 
                 # ── Checkpointing ─────────────────────────────────────────────
                 if step % SAVE_EVERY == 0:
@@ -362,9 +406,9 @@ def _validate(
                     valid = ctx_mel_lens[i][n]
                     ctx_enc_mask[i * N + n, :valid] = False
 
-            C_all = model.context_encoder(
+            C_all, _, _ = model.context_encoder(
                 ctx_flat, src_key_padding_mask=ctx_enc_mask
-            )  # [B*N, T_ctx, d_model]
+            )  # [B*N, T_ctx, d_model]  (mu/lv not needed at eval)
             T_ctx_enc = C_all.shape[1]
             C = C_all.view(B, N * T_ctx_enc, -1)  # [B, N*T_ctx, d_model]
 

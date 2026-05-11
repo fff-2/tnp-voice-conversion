@@ -108,13 +108,14 @@ class VoiceConversionModel(nn.Module):
         target_audio: Tensor,             # [B, T_tgt]          target waveform (loss)
         ctx_mask: Tensor | None = None,   # [B, T_ctx]  bool, True = padding
     ) -> tuple:
-        C = self.context_encoder(context_mel)
+        """Returns (pred_mel, target_mel, mu, log_var) for ELBO training."""
+        z, mu, log_var = self.context_encoder(context_mel)
         content = self.content_encoder(source_audio)
-        fused = self.cross_attention(content, C, key_padding_mask=ctx_mask)
+        fused = self.cross_attention(content, z, key_padding_mask=ctx_mask)
         pred_mel = self.decoder(fused)
         target_mel = self._compute_mel(target_audio)
         T = min(pred_mel.shape[1], target_mel.shape[1])
-        return pred_mel[:, :T, :], target_mel[:, :T, :]
+        return pred_mel[:, :T, :], target_mel[:, :T, :], mu, log_var
 
     # ── Inference helpers ─────────────────────────────────────────────────────
 

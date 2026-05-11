@@ -64,13 +64,15 @@ class VoiceConversionModel(nn.Module):
         ).to(device)
 
         # Mel transform matching vocos-mel-24khz training parameters:
-        # torchaudio defaults (power=2, htk scale, no norm) + log(x.clamp(1e-5))
+        # torchaudio defaults (htk scale, no norm) + power=1.0 + log(x.clamp(1e-7))
         self.mel_transform = torchaudio.transforms.MelSpectrogram(
             sample_rate=self.VOCODER_SR,
             n_fft=1024,
             hop_length=256,
             win_length=1024,
             n_mels=self.N_MELS,
+            power=1.0,
+            center=True,
         ).to(device)
 
         self.to(device)
@@ -97,7 +99,7 @@ class VoiceConversionModel(nn.Module):
         audio_24k = self.resampler(audio)             # [B, T_24k]
         mel = self.mel_transform(audio_24k)           # [B, N_MELS, T_mel]
         mel = mel.transpose(1, 2)                     # [B, T_mel, N_MELS]
-        return torch.log(mel.clamp(min=1e-5))
+        return torch.log(mel.clamp(min=1e-7))
 
     # ── Training forward pass ─────────────────────────────────────────────────
 

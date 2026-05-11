@@ -38,12 +38,12 @@ pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu12
 wget https://datashare.ed.ac.uk/bitstream/handle/10283/3443/VCTK-Corpus-0.92.zip
 unzip VCTK-Corpus-0.92.zip -d datasets/
 
-# 4. Preprocess mels on GPU (optional but recommended — eliminates CPU bottleneck)
+# 4. Preprocess: generate augmented audio tensors + cache mels on GPU
 python preprocess.py --data-root datasets/wav48_silence_trimmed
 
 python train.py                                                    # train
 python mic_convert.py --checkpoint checkpoints/best.pt            # real-time
- python convert.py --source me.wav --reference alice.wav --output out.wav # offline
+python convert.py --source me.wav --reference alice.wav --output out.wav # offline
 ```
 
 ---
@@ -150,34 +150,32 @@ Voice conversion requires separating *what is said* (phonetic content) from *who
 
 VCTK and LibriSpeech are **non-parallel**: each speaker says different sentences. Computing a frame-wise L1 loss between "Speaker A saying *apple*" and "Speaker B saying *banana*" is meaningless — the mel spectrograms have nothing to compare.
 
-### Self-reconstruction with cross-utterance separation
+### Self-reconstruction with offline augmentation
 
-The training loop uses a **self-reconstruction** objective to sidestep the parallel-data problem. For each training sample, two **different utterances** from the same target speaker are loaded:
+The training loop uses a **self-reconstruction** objective to sidestep the parallel-data problem. For each training sample, one speaker and one utterance are selected:
 
-- `audio_content` — the utterance whose linguistic content will be reconstructed
-- `context_mels` — N_CTX=5 reference utterances from the same speaker (always different clips from `audio_content`)
+- `source_audio` — the **Parselmouth-augmented** version of the utterance (pitch + formant shifted). Fed into the content encoder.
+- `audio_content` — the **clean** version of the same utterance. Used as the mel reconstruction target.
+- `context_mels` — N_CTX=5 **clean** reference utterances from the same speaker (always different clips).
 
 ```
 Training forward pass
 ─────────────────────────────────────────────────────────────────────
-audio_content  ──→  [ContentEncoder (frozen)]  ──→  content features
-                         (HuBERT discards speaker acoustics,
-                          preserves phonetics)
-                    ──→  HuBERT spatial dropout1d (p=0.3)  ──→  masked features
-                         (F0 channel bypasses dropout)
+source_audio   ──→  [ContentEncoder (frozen)]  ──→  content features
+  (augmented)       (HuBERT + InstanceNorm strips per-sample timbre)
 
 context_mels   ──→  [ContextEncoder Transformer]
-                    ──→  μ [B, T_ctx, 256],  log σ² [B, T_ctx, 256]
+  (clean)           ──→  μ [B, T_ctx, 256],  log σ² [B, T_ctx, 256]
                     ──→  z = μ + ε·σ,  ε ~ N(0, I)   ← reparameterization trick
 
-masked_content + z  ──→  [CrossAttention + Decoder]  ──→  pred_mel
+content + z    ──→  [CrossAttention + Decoder]  ──→  pred_mel
 
 ELBO loss:  L1( pred_mel,  mel(audio_content) )          ← reconstruction
           + β · KL( q(z|C) || N(0,I) )                  ← KL divergence
           β: 0 for steps 0–5000, linear ramp → 0.01 by step 20000 (KL annealing)
 ```
 
-Because both prediction and ground truth come from the same speaker, the loss is phonetically valid. The content and context clips are **always different utterances** — `dataset.py` excludes the content index from the pool of context candidates — so the decoder cannot reconstruct `audio_content` by copying its timbre from context; it must learn to extract timbre from `C`.
+Because prediction and ground truth come from the same speaker, the loss is phonetically valid. The augmented source has different pitch and formant characteristics from the clean context clips — the model cannot copy timbre from content features and must consult `C` to reconstruct the correct spectral shape.
 
 At **inference time** the roles switch to the intended conversion task:
 
@@ -203,15 +201,10 @@ HuBERT layer-6 features are not perfectly speaker-agnostic — some identity lea
 **Mitigation 1 — HuBERT Instance Normalization:**
 The content encoder applies `F.instance_norm` to HuBERT features before the F0 concat. It normalises each `(sample, channel)` pair to mean=0 / std=1 across the time dimension, stripping the per-sample spectral bias that encodes speaker timbre. This is a hard constraint: the model *cannot* reconstruct speaker identity from content features alone and must consult `C` via cross-attention. See the Implementation Notes for technical details.
 
-**Mitigation 2 — HuBERT Spatial Dropout (Information Bottleneck):**
-After the content encoder, the 769-dimensional content tensor is split into HuBERT features `[B, T_frames, 768]` and F0 `[B, T_frames, 1]`. `F.dropout1d(p=0.1)` is applied to the HuBERT slice only, zeroing entire channels across all time-steps. Unlike frame-level dropout which pokes random holes in individual elements, `dropout1d` eliminates whole temporal channels — if a HuBERT channel encodes persistent speaker timbre across time, zeroing its entire time-axis removes that signal completely. The F0 channel is concatenated back unchanged, preserving the pitch correction applied by the augmentation step. Dropout is automatically disabled during validation (`model.training = False`).
+**Mitigation 2 — Offline Pitch + Formant Augmentation:**
+`preprocess.py` pre-generates one Parselmouth-augmented variant per audio file (`_aug.pt`). Pitch and formant shift directions are sampled independently at random: pitch `Uniform(1.10, 1.30)` or `Uniform(0.70, 0.90)`; formant `Uniform(1.05, 1.15)` or `Uniform(0.85, 0.95)`. During training, the augmented audio is fed into the content encoder while the clean audio is used as the reconstruction target. The pitch shift forces the model to recover the correct pitch from context `z` rather than copying it from content features; the formant shift alters the vocal tract shape, making it harder to extract speaker identity from the content stream.
 
-**Mitigation 3 — Random Pitch Perturbation + F0 Feature Shifting:**
-Each training batch, the audio fed to the content encoder is pitch-shifted by a random amount uniformly sampled from **±4 semitones** (probability 0.3) using `torchaudio.functional.pitch_shift`. The target mel is computed from the **original, unshifted audio** — so the model cannot copy pitch from the content features and must recover the correct pitch from `z`.
-
-To complement this, the F0 feature inside the content encoder is corrected back to the original pitch range via `f0_stats=(0.0, ratio, 0.0, 1.0)` where `ratio = 2^(n_steps/12)`. This applies the transform `f0_feature = f0_shifted / ratio = f0_original` with no extra crepe pass, making training consistent with the F0-shifting behaviour used at inference.
-
-**Mitigation 4 — Variational KL Bottleneck (Stochastic TNP):**
+**Mitigation 3 — Variational KL Bottleneck (Stochastic TNP):**
 The context encoder applies a variational bottleneck after its Transformer layers. Instead of producing a single deterministic representation, it outputs `μ` and `log σ²` (each `[B, T_ctx, 256]`) and samples `z = μ + ε·σ` via the reparameterization trick. The ELBO adds a KL divergence penalty between `q(z|C) = N(μ, σ²)` and the isotropic prior `p(z) = N(0, I)`:
 
 ```
@@ -275,7 +268,13 @@ conda env create -f environment.yml
 
 `SpeakerDataset` loads audio from any folder of speaker sub-directories. No parallel recordings, no matched filenames, no special naming convention. Any sample rate is auto-resampled to 16 kHz. Minimum: **2 speakers**, **7 files each**.
 
-For each training sample it picks a random source speaker, a random target speaker, and `N_CTX=5` reference utterances from the target speaker. Context mels are computed at 24 kHz (100-band log-mel, `n_fft=1024`, `hop=256`) to match the Vocos vocoder.
+For each training sample it picks a speaker and an utterance from that speaker:
+
+- `source_audio` — the **Parselmouth-augmented** version of that utterance (`_aug.pt`), loaded as a 16 kHz audio tensor. Feeds into the content encoder. Falls back to the clean file if the augmented tensor has not been generated yet.
+- `audio_content` — the **clean** version of the same utterance. Used as the reconstruction target (mel ground truth).
+- `context_mels` — `N_CTX=5` **clean** reference utterances from the same speaker (always different clips), loaded from cached mel `.pt` files where available.
+
+Context mels are computed at 24 kHz (100-band log-mel, `n_fft=1024`, `hop=256`, `power=1.0`) to match the Vocos vocoder.
 
 <details>
 <summary>Dataset options and download commands</summary>
@@ -343,24 +342,38 @@ print(batch["ctx_mel_lens"])         # list[B] of list[N_CTX]: unpadded T per re
 
 ## Preprocessing — `preprocess.py`
 
-Computing mel spectrograms on the CPU inside the DataLoader is the primary bottleneck when training on a large dataset like VCTK (110 speakers × 400 utterances = ~44 000 files, taking over 2 hours per epoch on CPU). Running `preprocess.py` once converts every audio file to a cached `.pt` mel tensor on the GPU, reducing `dataset.py` mel loading to a simple `torch.load` call.
+`preprocess.py` runs two phases in sequence. Both are **safe to interrupt and resume** — existing `.pt` files are skipped automatically.
 
 ```bash
 python preprocess.py --data-root datasets/wav48_silence_trimmed
 python preprocess.py --data-root datasets/wav48_silence_trimmed --batch-size 64  # faster on high-VRAM GPUs
+python preprocess.py --data-root datasets/wav48_silence_trimmed --skip-aug       # mel cache only
 ```
 
-The script is **safe to interrupt and resume** — files with an existing `.pt` are skipped automatically.
+### Phase 1 — Parselmouth augmentation (CPU)
 
-**How it works:**
+For every audio file, one pitch+formant-shifted variant is created with Praat's *Change gender* algorithm and saved as a 16-kHz audio tensor alongside the source:
 
-1. Recursively finds all `.wav`/`.flac`/`.mp3`/`.ogg` files under `--data-root`
-2. Loads waveforms on the CPU with `soundfile.read` (8 workers, pin_memory)
-3. Pads variable-length waveforms to the batch maximum
-4. Resamples to 24 kHz and applies `MelSpectrogram` on the GPU in a single batched pass
-5. Trims padding from each mel, applies `log(mel.clamp(1e-5))`, saves as `.pt` next to the source file
+```
+p225_001_mic1.flac  →  p225_001_mic1_aug.pt   (float32 tensor, 16 kHz)
+```
 
-After preprocessing, `dataset.py` automatically detects the `.pt` files and loads them instead of recomputing the mel on the fly — no flag or config change needed.
+The shift direction for pitch and formant is sampled independently and at random:
+
+| Parameter | High direction | Low direction |
+|---|---|---|
+| Pitch ratio | `Uniform(1.10, 1.30)` | `Uniform(0.70, 0.90)` |
+| Formant ratio | `Uniform(1.05, 1.15)` | `Uniform(0.85, 0.95)` |
+
+`dataset.py` loads `_aug.pt` as `source_audio` (the content encoder input) and the original clean file as `audio_content` (the reconstruction target). If `_aug.pt` does not exist, clean audio is used as a fallback.
+
+### Phase 2 — GPU mel cache (batched)
+
+Computing mel spectrograms on the CPU inside the DataLoader is the primary bottleneck on large datasets (VCTK: ~44 000 files, >2 hours per epoch on CPU). Phase 2 converts every **clean** audio file to a cached log-mel tensor on the GPU, reducing `dataset.py` context-mel loading to a simple `torch.load` call.
+
+1. Loads waveforms on the CPU with `soundfile.read` (batched, pin_memory)
+2. Resamples to 24 kHz and applies `MelSpectrogram` on the GPU in a single batched pass
+3. Trims padding, applies `log(mel.clamp(1e-7))`, saves as `<stem>.pt` next to the source file
 
 <details>
 <summary>CLI flags</summary>
@@ -368,15 +381,19 @@ After preprocessing, `dataset.py` automatically detects the `.pt` files and load
 | Flag | Default | Description |
 |---|---|---|
 | `--data-root` | *(required)* | Root directory of audio files |
-| `--batch-size` | `32` | GPU batch size — increase to fill VRAM |
-| `--num-workers` | `8` | DataLoader CPU worker count |
+| `--batch-size` | `32` | GPU batch size for Phase 2 — increase to fill VRAM |
+| `--num-workers` | `8` | DataLoader CPU worker count for Phase 2 |
+| `--seed` | `42` | RNG seed for augmentation direction sampling |
+| `--skip-aug` | off | Skip Phase 1 and run mel cache only |
 
 </details>
 
 <details>
 <summary>Disk space</summary>
 
-Each `.pt` file stores a `float32` tensor of shape `[100, T_mel]`. For a typical 5-second clip at 24 kHz with hop 256: `T_mel ≈ 470` frames → `100 × 470 × 4 bytes ≈ 188 KB` per file. The full VCTK dataset adds roughly **8–10 GB** of `.pt` files alongside the original audio.
+**Phase 1 (`_aug.pt`):** Each file stores a `float32` audio tensor at 16 kHz. For a 5-second clip: `5 × 16 000 × 4 bytes ≈ 320 KB` per file. Full VCTK adds roughly **14 GB**.
+
+**Phase 2 (`<stem>.pt`):** Each file stores a `float32` mel tensor `[100, T_mel]`. For a 5-second clip: `100 × 470 × 4 bytes ≈ 188 KB`. Full VCTK adds roughly **8–10 GB**.
 
 </details>
 
@@ -431,11 +448,11 @@ Every `SAVE_EVERY` steps, validation saves three WAV files to `checkpoints/sampl
 
 | File | Content |
 |---|---|
-| `source.wav` | Raw source speaker audio from the first validation batch (16 kHz) |
-| `target.wav` | Raw target speaker audio from the first validation batch (16 kHz) |
-| `converted.wav` | Source content + target speaker C, decoded through Vocos (24 kHz) |
+| `source.wav` | Augmented source audio from the first validation batch (16 kHz) |
+| `target.wav` | Clean audio content from the first validation batch (16 kHz) |
+| `converted.wav` | Augmented source content + clean context C, decoded through Vocos (24 kHz) |
 
-`converted.wav` feeds **source** audio into the content encoder (not target), mirroring real inference rather than the self-reconstruction loss path. Use it to track cross-speaker generalisation: early in training it will sound like the source; as training progresses it should shift toward the target speaker's voice characteristics.
+`converted.wav` mirrors the training path: augmented audio into the content encoder, clean context clips as speaker reference. Use it to track how well the model reconstructs clean speech from perturbed input. With F0 shifting applied, the converted output should match the clean target's pitch register.
 
 <details>
 <summary>CLI flags and key constants</summary>
@@ -581,7 +598,7 @@ python client/stream_client.py `
 `VoiceConversionModel.train()` is overridden to re-call `.eval()` on `content_encoder` and `vocoder` immediately after `super().train()`. PyTorch's `.train()` propagates to all submodules — without this override it would accidentally enable dropout and BatchNorm in HuBERT and Vocos. If you add a new frozen submodule, add it to that override.
 
 **Dual sample rates**
-The content encoder (DFN3 + HuBERT + crepe) operates at **16 kHz**. The mel computation and Vocos vocoder operate at **24 kHz**. Audio is resampled 16 kHz → 24 kHz before the mel transform; the vocoder outputs native 24 kHz audio. Do not change the mel parameters (`n_fft=1024`, `hop_length=256`, `n_mels=100`) — they must match Vocos's training configuration exactly.
+The content encoder (DFN3 + HuBERT + crepe) operates at **16 kHz**. The mel computation and Vocos vocoder operate at **24 kHz**. Audio is resampled 16 kHz → 24 kHz before the mel transform; the vocoder outputs native 24 kHz audio. Do not change the mel parameters (`n_fft=1024`, `hop_length=256`, `n_mels=100`, `power=1.0`) — they must match Vocos's training configuration exactly.
 
 **DeepFilterNet3 runs at 48 kHz**
 DFN3 operates internally at 48 kHz. The content encoder resamples around it:
@@ -601,10 +618,8 @@ In streaming mode the DFN GRU must only advance over **new** audio. `mic_convert
 **Audio loading — soundfile, not torchaudio.load**
 `convert.py` and `mic_convert.py` load audio with `soundfile.read()` directly. Recent versions of torchaudio default to `torchcodec` as the backend, which is not installed in this environment. `soundfile` natively handles WAV, FLAC, OGG, and AIFF without any codec dependency. `dataset.py` has always used `soundfile`; the inference scripts were updated to match.
 
-**Pitch perturbation training augmentation**
-With probability 0.3 each training batch, the audio fed to the content encoder is pitch-shifted by a random `n_steps ∈ Uniform(−2, +2)` semitones using `torchaudio.functional.pitch_shift` (phase vocoder, runs in float32 on GPU). The target mel is computed from the **original** audio. This prevents copy-synthesis: the model cannot read the correct pitch from content features and must recover it from `C`.
-
-The F0 feature inside the content encoder is then corrected via `f0_stats=(0.0, ratio, 0.0, 1.0)` where `ratio = 2^(n_steps/12)`, which applies `f0_feature = f0_shifted / ratio ≈ f0_original` — no extra crepe inference required. This keeps training consistent with the F0 Z-score shifting applied at inference.
+**Offline pitch + formant augmentation**
+`preprocess.py` Phase 1 generates `<stem>_aug.pt` — a 16-kHz audio tensor produced by Praat's *Change gender* algorithm with randomised pitch and formant ratios. Pitch direction (up or down) and formant direction are sampled independently so the combination covers a wide range of voice characteristics. The augmented tensor is stored once and loaded by `dataset.py` at training time, avoiding the cost of running Parselmouth or `torchaudio.functional.pitch_shift` inside the training loop. If `_aug.pt` is missing for a given file, `_load_aug()` silently falls back to clean audio.
 
 **F0 log scaling and cross-speaker Z-score shift**
 Raw F0 from torchcrepe spans `[0, 2006]` Hz while HuBERT features fall roughly in `[-3, +3]`. `torch.log1p(f0)` maps F0 to `[0, ~7.6]`, preventing it from dominating the linear projection.
@@ -635,20 +650,11 @@ After the Transformer and `LayerNorm`, two linear heads project to `μ [B, T_ctx
 
 The two new projection heads are initialised specially to avoid disrupting a resumed checkpoint: `μ_proj` starts as an identity matrix (so `μ = x` on step 0), `log σ²_proj` starts with zero weights and bias `−5` (so `σ ≈ 0.08` — nearly no noise). The training signal immediately corrects these from the first gradient step.
 
-**HuBERT spatial dropout — information bottleneck**
-After the frozen content encoder and before cross-attention, the training loop splits the `[B, T_frames, 769]` content tensor into HuBERT features `[:, :, :768]` and F0 `[:, :, 768:]`, applies `F.dropout1d` to the HuBERT slice with `p=0.1`, then concatenates F0 back:
-```python
-hubert_feat = F.dropout1d(
-    hubert_feat.transpose(1, 2),   # [B, 768, T_frames]
-    p=0.1,
-    training=model.training,
-).transpose(1, 2)                  # [B, T_frames, 768]
-content = torch.cat([hubert_feat, f0_feat], dim=-1)
-```
-`dropout1d` zeros entire channels across **all** time-steps — if a HuBERT channel encodes persistent speaker timbre (which manifests as a consistent signal across time, not random frame noise), the whole temporal trace of that channel is silenced. Plain `F.dropout` only pokes holes in individual elements, leaving the pattern largely intact. The F0 channel bypasses dropout entirely so the pitch correction applied by the augmentation step is preserved going into cross-attention. The op is a no-op during `model.eval()`, so validation loss and checkpoint audio samples are unaffected.
+**HuBERT Instance Normalization**
+`F.instance_norm` is applied to HuBERT features `[B, 768, T_frames]` before the F0 concat. It normalises each `(sample, channel)` pair to mean=0 / std=1 across the time dimension, stripping the per-sample spectral bias that encodes speaker timbre. Combined with the offline pitch+formant augmentation, this is the primary hard constraint preventing copy-synthesis from the content stream.
 
 **Masked L1 loss**
-The training loss is computed only over valid (non-padded) mel frames. `collate_fn` returns `content_lengths` (original audio sample counts for the content clip); the training loop converts these to mel frame counts and builds a boolean mask before calling `F.l1_loss(..., reduction="none")`. Padding regions contain `log(1e-5) ≈ −11.5` and would otherwise waste model capacity if included in the loss.
+The training loss is computed only over valid (non-padded) mel frames. `collate_fn` returns `content_lengths` (original audio sample counts for the content clip); the training loop converts these to mel frame counts and builds a boolean mask before calling `F.l1_loss(..., reduction="none")`. Padding regions contain `log(1e-7) ≈ −16.1` and would otherwise waste model capacity if included in the loss.
 
 **ELBO — KL divergence and annealing**
 The total training loss is the ELBO: `recon_loss + β · kl_loss`. The KL term is also masked — padded context positions are excluded via `~ctx_mask` before summing:

@@ -127,10 +127,10 @@ def audio_to_mel(audio: torch.Tensor, device: torch.device) -> torch.Tensor:
     """[1, T @ 16kHz] → [1, N_MELS, T_mel] log mel at 24000 Hz."""
     audio_24k = AF.resample(audio, SR, VOCODER_SR)
     tf = torchaudio.transforms.MelSpectrogram(
-        sample_rate=VOCODER_SR, n_fft=1024, hop_length=256, win_length=1024, n_mels=N_MELS,
+        sample_rate=VOCODER_SR, n_fft=1024, hop_length=256, win_length=1024, n_mels=N_MELS, power=1.0, center=True,
     ).to(device)
     mel = tf(audio_24k)
-    return torch.log(mel.clamp(min=1e-5))
+    return torch.log(mel.clamp(min=1e-7))
 
 
 # ── Real-time converter ───────────────────────────────────────────────────────

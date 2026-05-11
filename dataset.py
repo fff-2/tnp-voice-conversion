@@ -90,28 +90,20 @@ class SpeakerDataset(Dataset):
         self.speakers: dict[str, list[Path]] = {s: speakers[s] for s in chosen}
         self.spk_names = list(self.speakers.keys())
 
-        # Build index: each entry is (src_spk, tgt_spk, src_idx, tgt_idx)
-        # We create N_PAIRS pairs per speaker combination
-        N_PAIRS = 50
-        self.pairs: list[tuple[str, str, int, int]] = []
+        # Build index: each entry is (spk, utt_idx).
+        # source = augmented version of utt_idx; audio_content = clean version.
+        N_ITEMS = 200  # items per speaker
+        self.pairs: list[tuple[str, int]] = []
         rng2 = random.Random(seed + 1)
-        for i, src in enumerate(self.spk_names):
-            for tgt in self.spk_names:
-                if src == tgt:
-                    continue
-                src_files = self.speakers[src]
-                tgt_files = self.speakers[tgt]
-                for _ in range(N_PAIRS):
-                    self.pairs.append((
-                        src, tgt,
-                        rng2.randrange(len(src_files)),
-                        rng2.randrange(len(tgt_files)),
-                    ))
+        for spk in self.spk_names:
+            files = self.speakers[spk]
+            for _ in range(N_ITEMS):
+                self.pairs.append((spk, rng2.randrange(len(files))))
 
         rng2.shuffle(self.pairs)
 
         print(f"SpeakerDataset [{split}]: {len(self.spk_names)} speakers, "
-              f"{len(self.pairs)} pairs")
+              f"{len(self.pairs)} items")
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
@@ -129,15 +121,23 @@ class SpeakerDataset(Dataset):
             wav = wav[start: start + self.max_samples]
         return wav
 
+    def _load_aug(self, path: Path) -> torch.Tensor | None:
+        """Load full augmented audio tensor (16 kHz) from _aug.pt, untrimed.
+        Returns None if the augmented file is missing."""
+        aug_pt = path.with_name(f"{path.stem}_aug.pt")
+        if aug_pt.exists():
+            return torch.load(aug_pt, weights_only=True)
+        return None
+
     @staticmethod
     def _mel(audio: torch.Tensor) -> torch.Tensor:
         """[T] → [N_MELS, T_mel] log-compressed mel at 24000 Hz (on CPU)."""
         audio_24k = torchaudio.functional.resample(audio.unsqueeze(0), SAMPLE_RATE, MEL_SAMPLE_RATE).squeeze(0)
         transform = torchaudio.transforms.MelSpectrogram(
-            sample_rate=MEL_SAMPLE_RATE, n_fft=1024, hop_length=256, win_length=1024, n_mels=N_MELS,
+            sample_rate=MEL_SAMPLE_RATE, n_fft=1024, hop_length=256, win_length=1024, n_mels=N_MELS, power=1.0, center=True,
         )
         mel = transform(audio_24k.unsqueeze(0)).squeeze(0)   # [N_MELS, T_mel]
-        return torch.log(mel.clamp(min=1e-5))
+        return torch.log(mel.clamp(min=1e-7))
 
     # ── Dataset interface ─────────────────────────────────────────────────────
 
@@ -145,32 +145,47 @@ class SpeakerDataset(Dataset):
         return len(self.pairs)
 
     def __getitem__(self, idx: int) -> dict:
-        src_spk, tgt_spk, src_idx, tgt_idx = self.pairs[idx]
+        spk, utt_idx = self.pairs[idx]
+        spk_files = self.speakers[spk]
 
-        source_audio = self._load(self.speakers[src_spk][src_idx])
-        # audio_content: the utterance whose content will be reconstructed.
-        # Context mels are drawn from different clips of the same speaker (see below),
-        # so the model must extract timbre from context, not copy it from content features.
-        audio_content = self._load(self.speakers[tgt_spk][tgt_idx])
+        # Load clean audio (full, untrimed) and pick one shared start offset.
+        path = spk_files[utt_idx]
+        data, sr = sf.read(str(path), dtype="float32", always_2d=True)
+        wav = torch.from_numpy(data.T)
+        if wav.shape[0] > 1:
+            wav = wav.mean(0, keepdim=True)
+        if sr != SAMPLE_RATE:
+            wav = torchaudio.functional.resample(wav, sr, SAMPLE_RATE)
+        wav = wav.squeeze(0)  # [T] @ 16 kHz
 
-        # N_CTX reference utterances from target speaker (excluding tgt_idx so
-        # audio_content and all context clips are always different utterances)
-        tgt_files = self.speakers[tgt_spk]
-        ctx_indices = [i for i in range(len(tgt_files)) if i != tgt_idx]
+        start = random.randint(0, max(0, wav.shape[0] - self.max_samples))
+        audio_content = wav[start: start + self.max_samples]
+
+        # Apply the same start to the augmented tensor so source and content
+        # cover the same portion of the utterance.
+        aug_wav = self._load_aug(path)
+        if aug_wav is not None:
+            aug_start = min(start, max(0, aug_wav.shape[0] - self.max_samples))
+            source_audio = aug_wav[aug_start: aug_start + self.max_samples]
+        else:
+            source_audio = audio_content  # fallback: clean
+
+        # N_CTX clean reference utterances from the same speaker (excluding utt_idx).
+        ctx_indices = [i for i in range(len(spk_files)) if i != utt_idx]
         ctx_indices = random.sample(ctx_indices, min(self.n_ctx, len(ctx_indices)))
         max_mel_frames = int(self.max_samples * (MEL_SAMPLE_RATE / SAMPLE_RATE) / 256)
-
+        
         mels = []
         mel_lens = []
         for i in ctx_indices:
-            cache = tgt_files[i].with_suffix(".pt")
+            cache = spk_files[i].with_suffix(".pt")
             if cache.exists():
                 mel = torch.load(cache, weights_only=True).float()
                 if mel.shape[-1] > max_mel_frames:
                     start = random.randint(0, mel.shape[-1] - max_mel_frames)
                     mel = mel[:, start : start + max_mel_frames]
             else:
-                mel = self._mel(self._load(tgt_files[i]))
+                mel = self._mel(self._load(spk_files[i]))
             mel_lens.append(mel.shape[-1])  # unpadded T for this mel
             mels.append(mel)
         max_T = max(m.shape[-1] for m in mels)

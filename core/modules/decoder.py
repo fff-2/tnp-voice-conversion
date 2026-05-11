@@ -28,7 +28,7 @@ class MelDecoder(nn.Module):
     Decodes cross-attention output to mel spectrogram with 2× temporal upsampling.
 
     Input:  [B, T_frames, d_model]   at HuBERT rate (50 Hz)
-    Output: [B, T_frames*2, n_mels]  at vocoder rate (100 Hz)
+    Output: [B, T_frames*1.875, n_mels]  at vocoder rate (93.75 Hz)
 
     Trainable.
     """
@@ -68,7 +68,7 @@ class MelDecoder(nn.Module):
         Args:
             x:   [B, T_frames, d_model]
         Returns:
-            mel: [B, T_frames*2, n_mels]
+            mel: [B, T_mel, n_mels]
         """
         for block in self.conv_blocks:
             x = block(x)                               # [B, T_frames, d_model]
@@ -80,8 +80,8 @@ class MelDecoder(nn.Module):
 
         # Upsample time dimension
         x = x.transpose(1, 2)                          # [B, d_model, T_frames]
-        x = self.upsample(x)                           # [B, d_model, T_frames*2]
-        x = x.transpose(1, 2)                          # [B, T_frames*2, d_model]
+        x = self.upsample(x)                           # [B, d_model, T_mel]
+        x = x.transpose(1, 2)                          # [B, T_mel, d_model]
 
-        mel = self.out_proj(x)                         # [B, T_frames*2, n_mels]
+        mel = self.out_proj(x)                         # [B, T_mel, n_mels]
         return mel

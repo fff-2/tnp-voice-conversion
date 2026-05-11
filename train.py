@@ -20,7 +20,6 @@ Usage:
 import argparse
 import csv
 import math
-import random
 import sys
 from pathlib import Path
 
@@ -43,9 +42,9 @@ VOCODER_SR = 24_000  # mel computation and vocoder output sample rate
 BATCH_SIZE = 32  # physical batch per GPU step — increase to fill VRAM
 GRAD_ACCUM = 2  # effective batch = BATCH_SIZE * GRAD_ACCUM = 32
 MAX_STEPS = 100_000
-SAVE_EVERY = 1000
-LOG_EVERY = 50
-CSV_LOG_EVERY = 50
+SAVE_EVERY = 1
+LOG_EVERY = 1
+CSV_LOG_EVERY = 1
 WARMUP_STEPS = 1_000
 LR = 1e-4
 WEIGHT_DECAY = 1e-2
@@ -59,6 +58,10 @@ N_MELS = 100
 KL_ANNEAL_START = 5_000
 KL_ANNEAL_END = 20_000
 KL_BETA_MAX = 0.01
+
+HUBERT_NOISE_STD = (
+    0.01  # std of additive Gaussian noise on HuBERT features (training only)
+)
 
 
 # ── LR schedule: linear warmup → cosine decay ────────────────────────────────
@@ -77,7 +80,8 @@ def get_beta(step: int) -> float:
         return 0.0
     if step >= KL_ANNEAL_END:
         return KL_BETA_MAX
-    return KL_BETA_MAX * (step - KL_ANNEAL_START) / (KL_ANNEAL_END - KL_ANNEAL_START)
+    # return KL_BETA_MAX * (step - KL_ANNEAL_START) / (KL_ANNEAL_END - KL_ANNEAL_START)
+    return 0.0001
 
 
 # ── Training loop ─────────────────────────────────────────────────────────────
@@ -155,13 +159,15 @@ def train(args) -> None:
         hop_length=256,
         win_length=1024,
         n_mels=N_MELS,
+        power=1.0,
+        center=True,
     ).to(device)
 
     def compute_target_mel(audio: torch.Tensor) -> torch.Tensor:
         """[B, T @ 16kHz] → [B, T_mel, N_MELS] log-compressed, channels-last."""
         mel = mel_transform(mel_resampler(audio))  # [B, N_MELS, T_mel]
         mel = mel.transpose(1, 2)  # [B, T_mel, N_MELS]
-        return torch.log(mel.clamp(min=1e-5))
+        return torch.log(mel.clamp(min=1e-7))
 
     # ── Training loop ─────────────────────────────────────────────────────────
     optimizer.zero_grad()
@@ -174,7 +180,8 @@ def train(args) -> None:
             if step >= MAX_STEPS:
                 break
 
-            content_audio = batch["audio_content"].to(device)  # [B, T_content]
+            source_audio = batch["source_audio"].to(device)  # [B, T] augmented
+            content_audio = batch["audio_content"].to(device)  # [B, T] clean target
             ctx_mels = batch["context_mels"].to(device)  # [B, N_CTX, N_MELS, T_ctx]
             content_lengths = batch[
                 "content_lengths"
@@ -184,21 +191,6 @@ def train(args) -> None:
             B, N, M, T_ctx = ctx_mels.shape
             # Flatten context batch for context encoder
             ctx_flat = ctx_mels.view(B * N, M, T_ctx)  # [B*N, N_MELS, T_ctx]
-
-            # ── Pitch perturbation (disentanglement augmentation, p=0.5) ────────
-            # Randomly shift pitch of the content-encoder input by ±6 semitones.
-            # The target mel is computed from the ORIGINAL target so the model
-            # must use context C to recover the correct pitch — breaking copy-synthesis.
-            if random.random() < 0.3:
-                n_steps = random.uniform(-4.0, 4.0)
-                pitch_ratio = 2.0 ** (n_steps / 12.0)
-                with torch.no_grad():
-                    content_shifted = torchaudio.functional.pitch_shift(
-                        content_audio.float(), SAMPLE_RATE, n_steps
-                    ).to(content_audio.dtype)
-            else:
-                content_shifted = content_audio
-                pitch_ratio = 1.0
 
             with torch.amp.autocast(
                 "cuda", dtype=torch.bfloat16, enabled=(device.type == "cuda")
@@ -247,30 +239,24 @@ def train(args) -> None:
                 )
 
                 # ── Content encoding (frozen, no grad) ────────────────────────
-                # F0 shifting undoes the pitch perturbation at feature level:
-                # (0, pitch_ratio, 0, 1) → f0_feature = f0_shifted / pitch_ratio = f0_original
-                # Forces the model to rely on C for pitch rather than content features.
+                # source_audio is the Parselmouth-augmented version of the target
+                # utterance.  The model must rely on clean context C to recover
+                # speaker identity rather than copying it from content features.
                 with torch.no_grad():
-                    content = model.content_encoder(
-                        content_shifted,
-                        f0_stats=(0.0, float(pitch_ratio), 0.0, 1.0),
-                    )  # [B, T_frames, 769]
+                    content = model.content_encoder(source_audio)  # [B, T_frames, 769]
 
-                # ── HuBERT spatial dropout (information bottleneck) ───────────
-                # dropout1d zeros whole time-steps per channel, destroying any
-                # speaker-identity signal that persists across time rather than
-                # corrupting individual frames. F0 (last dim) is left intact so
-                # the pitch correction from the augmentation step is preserved.
+                """  # ── HuBERT Gaussia[n noise (information bottleneck) ────────────
+                # Additive noise perturbs features without zeroing entire channels.
+                # F0 (last dim) is left intact so pitch correction is preserved.
                 hubert_feat = content[..., :768]  # [B, T_frames, 768]
                 f0_feat = content[..., 768:]  # [B, T_frames, 1]
-                hubert_feat = F.dropout1d(
-                    hubert_feat.transpose(1, 2),  # [B, 768, T_frames]
-                    p=0.05,
-                    training=model.training,
-                ).transpose(1, 2)  # [B, T_frames, 768]
+                if model.training:
+                    hubert_feat = (
+                        hubert_feat + torch.randn_like(hubert_feat) * HUBERT_NOISE_STD
+                    )
                 content = torch.cat(
                     [hubert_feat, f0_feat], dim=-1
-                )  # [B, T_frames, 769]
+                )  # [B, T_frames, 769] """
 
                 # ── Cross-attention + decode ──────────────────────────────────
                 fused = model.cross_attention(
@@ -383,7 +369,7 @@ def _validate(
 ) -> float:
     model.eval()
     total_loss = 0.0
-    n = 0
+    num_batches = 0
     samples_saved = False
 
     for batch in loader:
@@ -422,7 +408,7 @@ def _validate(
             fused = model.cross_attention(content, C, key_padding_mask=ctx_mask)
             pred_mel = model.decoder(fused)
             tgt_mel = mel_transform(mel_resampler(content_audio)).transpose(1, 2)
-            tgt_mel = torch.log(tgt_mel.clamp(min=1e-5))
+            tgt_mel = torch.log(tgt_mel.clamp(min=1e-7))
             T = min(pred_mel.shape[1], tgt_mel.shape[1])
             mel_lengths = [
                 1 + math.ceil(n_samples * VOCODER_SR / SAMPLE_RATE) // 256
@@ -437,7 +423,7 @@ def _validate(
             loss = (loss_raw * mask.unsqueeze(-1)).sum() / (mask.sum() * N_MELS + 1e-8)
 
         total_loss += loss.item()
-        n += 1
+        num_batches += 1
 
         # ── Audio samples: first batch only ──────────────────────────────────
         if not samples_saved and output_dir is not None:
@@ -497,10 +483,20 @@ def _validate(
                 VOCODER_SR,
             )
 
-        if n >= 50:  # cap validation batches for speed
+            # context.wav: first reference clip decoded through Vocos
+            ctx_len_frames = ctx_mel_lens[0][0]
+            ctx_mel_sample = ctx_mels[0, 0, :, :ctx_len_frames].unsqueeze(0).float()
+            ctx_wav = model.vocoder(ctx_mel_sample)  # [1, 1, T_wav]
+            sf.write(
+                str(sample_dir / "context.wav"),
+                ctx_wav[0, 0, :].cpu().numpy(),
+                VOCODER_SR,
+            )
+
+        if num_batches >= 50:  # cap validation batches for speed
             break
 
-    return total_loss / max(1, n)
+    return total_loss / max(1, num_batches)
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────

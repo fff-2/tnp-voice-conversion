@@ -79,7 +79,7 @@ async def startup() -> None:
     _model.eval()
 
     _mel_transform = torchaudio.transforms.MelSpectrogram(
-        sample_rate=VOCODER_SR, n_fft=1024, hop_length=256, win_length=1024, n_mels=N_MELS,
+        sample_rate=VOCODER_SR, n_fft=1024, hop_length=256, win_length=1024, n_mels=N_MELS, power=1.0, center=True,
     ).to(_device)
 
     _executor = ThreadPoolExecutor(max_workers=4)
@@ -112,7 +112,7 @@ def _compute_context_sync(wav_bytes: bytes, speaker_id: str) -> torch.Tensor:
     # Resample to 24000 Hz for mel (matches vocos-mel-24khz training params)
     waveform_24k = torchaudio.functional.resample(waveform, SAMPLE_RATE, VOCODER_SR)
     mel = _mel_transform(waveform_24k)             # [1, N_MELS, T_mel]
-    mel = torch.log(mel.clamp(min=1e-5))
+    mel = torch.log(mel.clamp(min=1e-7))
 
     # Compute context vector
     C = _model.compute_context([mel])  # [1, D_MODEL]

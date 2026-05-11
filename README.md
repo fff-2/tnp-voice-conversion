@@ -134,12 +134,12 @@ SOURCE SPEAKER (live mic / audio file)
 
 | Module | Trainable | Parameters |
 |---|---|---|
-| ContextEncoder (Transformer + μ/log σ² heads) | Yes | ~3.5 M |
+| ContextEncoder (Transformer + μ/log σ² heads) | Yes | ~3.3 M |
 | CrossAttentionFusion | Yes | ~1.0 M |
 | MelDecoder | Yes | ~2.6 M |
 | ContentEncoder (DFN3 + HuBERT + crepe) | No | ~122 M |
 | VocosVocoder | No | ~13.4 M |
-| **Total trainable** | | **~7.1 M (~27 MB fp32)** |
+| **Total trainable** | | **~6.9 M (~26 MB fp32)** |
 
 ---
 

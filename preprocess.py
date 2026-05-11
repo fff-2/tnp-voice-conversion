@@ -136,14 +136,16 @@ class WavDataset(Dataset):
 
 def collate_fn(batch: list) -> tuple:
     wavs, srs, paths = zip(*batch)
-    assert len(set(srs)) == 1, (
-        f"Mixed sample rates in batch {set(srs)} — "
-        "ensure all files in the dataset share the same sample rate."
-    )
-    lengths = [w.shape[0] for w in wavs]
+    resampled_wavs = []
+    for w, sr in zip(wavs, srs):
+        if sr != MEL_SR:
+            w = torchaudio.functional.resample(w, sr, MEL_SR)
+        resampled_wavs.append(w)
+    
+    lengths = [w.shape[0] for w in resampled_wavs]
     max_len = max(lengths)
-    padded  = torch.stack([F.pad(w, (0, max_len - w.shape[0])) for w in wavs])
-    return padded, lengths, srs[0], paths
+    padded  = torch.stack([F.pad(w, (0, max_len - w.shape[0])) for w in resampled_wavs])
+    return padded, lengths, MEL_SR, paths
 
 
 def run_mel_cache(
@@ -171,19 +173,14 @@ def run_mel_cache(
     with torch.no_grad():
         for padded, lengths, native_sr, paths in tqdm(loader, desc="Mel cache", unit="batch"):
             padded = padded.to(device)
-            if native_sr != MEL_SR:
-                if resampler is None:
-                    resampler = torchaudio.transforms.Resample(
-                        native_sr, MEL_SR
-                    ).to(device)
-                padded = resampler(padded)
+            # padded is already resampled to MEL_SR in collate_fn
 
             mel_padded = torch.log(mel_transform(padded).clamp(min=1e-7))
             mel_padded = mel_padded.cpu()
 
             for mel, path, orig_len in zip(mel_padded, paths, lengths):
-                t_24k = math.ceil(orig_len * MEL_SR / native_sr)
-                t_mel = 1 + t_24k // HOP
+                # orig_len is already at MEL_SR
+                t_mel = 1 + orig_len // HOP
                 torch.save(mel[:, :t_mel].clone(), Path(path).with_suffix(".pt"))
 
 

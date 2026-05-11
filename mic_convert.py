@@ -230,24 +230,36 @@ class RealtimeConverter:
         """Update EMA statistics from the current chunk's raw features."""
         hub_mean_np = hub_mean_t[0].cpu().numpy()            # [768]
         hub_std_np  = hub_std_t[0].cpu().numpy()             # [768]
-        self._hub_ema_mean = (
-            EMA_MOMENTUM * self._hub_ema_mean + (1.0 - EMA_MOMENTUM) * hub_mean_np
-        )
-        self._hub_ema_std = (
-            EMA_MOMENTUM * self._hub_ema_std  + (1.0 - EMA_MOMENTUM) * hub_std_np
-        )
+        
+        # Initialize EMA on the first chunk to prevent warmup bias
+        if self._stats_chunks == 0:
+            self._hub_ema_mean = hub_mean_np.copy()
+            self._hub_ema_std = hub_std_np.copy()
+        else:
+            self._hub_ema_mean = (
+                EMA_MOMENTUM * self._hub_ema_mean + (1.0 - EMA_MOMENTUM) * hub_mean_np
+            )
+            self._hub_ema_std = (
+                EMA_MOMENTUM * self._hub_ema_std  + (1.0 - EMA_MOMENTUM) * hub_std_np
+            )
 
         f0_np = f0_t[0, :, 0].cpu().numpy()                 # [T_frames]
         voiced = f0_np > 0.0
         if voiced.sum() > 1:
             chunk_f0_mean = float(f0_np[voiced].mean())
             chunk_f0_std  = float(f0_np[voiced].std())
-            self._src_f0_ema_mean = (
-                EMA_MOMENTUM * self._src_f0_ema_mean + (1.0 - EMA_MOMENTUM) * chunk_f0_mean
-            )
-            self._src_f0_ema_std = (
-                EMA_MOMENTUM * self._src_f0_ema_std  + (1.0 - EMA_MOMENTUM) * chunk_f0_std
-            )
+            
+            # Initialize F0 EMA on the first voiced chunk
+            if self._src_f0_ema_mean == 0.0:
+                self._src_f0_ema_mean = chunk_f0_mean
+                self._src_f0_ema_std = chunk_f0_std
+            else:
+                self._src_f0_ema_mean = (
+                    EMA_MOMENTUM * self._src_f0_ema_mean + (1.0 - EMA_MOMENTUM) * chunk_f0_mean
+                )
+                self._src_f0_ema_std = (
+                    EMA_MOMENTUM * self._src_f0_ema_std  + (1.0 - EMA_MOMENTUM) * chunk_f0_std
+                )
 
     # ── Stats accessors for inference ─────────────────────────────────────────
 

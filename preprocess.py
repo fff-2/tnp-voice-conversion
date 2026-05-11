@@ -63,15 +63,11 @@ def _load_to_16k(path: str) -> torch.Tensor:
     return wav
 
 
-def _augment_file(path: Path, rng: random.Random) -> None:
+def _augment_file_worker(args: tuple[Path, float, float]) -> None:
+    path, pitch_ratio, formant_ratio = args
     out_pt = path.with_name(path.stem + "_aug.pt")
     if out_pt.exists():
         return
-    # Randomly pick direction for pitch and formant independently
-    pitch_range   = rng.choice([(1.10, 1.30), (0.70, 0.90)])
-    formant_range = rng.choice([(1.05, 1.15), (0.85, 0.95)])
-    pitch_ratio   = rng.uniform(*pitch_range)
-    formant_ratio = rng.uniform(*formant_range)
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
         tmp_path = tmp.name
     try:
@@ -85,7 +81,7 @@ def _augment_file(path: Path, rng: random.Random) -> None:
         Path(tmp_path).unlink(missing_ok=True)
 
 
-def run_augmentation(root: Path, seed: int) -> None:
+def run_augmentation(root: Path, seed: int, num_workers: int = 8) -> None:
     files = sorted(
         p for p in root.rglob("*")
         if p.suffix.lower() in AUDIO_EXTENSIONS
@@ -97,8 +93,17 @@ def run_augmentation(root: Path, seed: int) -> None:
         return
 
     rng = random.Random(seed)
-    for path in tqdm(todo, desc="Augmenting", unit="file"):
-        _augment_file(path, rng)
+    tasks = []
+    for path in todo:
+        pitch_range   = rng.choice([(1.10, 1.30), (0.70, 0.90)])
+        formant_range = rng.choice([(1.05, 1.15), (0.85, 0.95)])
+        pitch_ratio   = rng.uniform(*pitch_range)
+        formant_ratio = rng.uniform(*formant_range)
+        tasks.append((path, pitch_ratio, formant_ratio))
+
+    import concurrent.futures
+    with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
+        list(tqdm(executor.map(_augment_file_worker, tasks), total=len(tasks), desc="Augmenting", unit="file"))
 
 
 # ── Phase 2: GPU mel cache ────────────────────────────────────────────────────
@@ -206,7 +211,7 @@ def main() -> None:
 
     root = Path(args.data_root)
     if not args.skip_aug:
-        run_augmentation(root, args.seed)
+        run_augmentation(root, args.seed, args.num_workers)
 
     run_mel_cache(args.data_root, args.batch_size, args.num_workers, device)
     print("\nDone.")

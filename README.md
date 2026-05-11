@@ -488,14 +488,14 @@ Microphone  →  mic_queue  →  Inference thread  →  Jitter buffer  →  Spea
 
 </details>
 
----
+---python convert.py --source me.wav --reference alice.wav --output converted.wav
 
 ## Offline Inference — `convert.py`
 
 Converts an audio file without a microphone or server. Useful for evaluating a checkpoint before moving to real-time use.
 
 ```bash
-python convert.py --source me.wav --reference alice.wav --output converted.wav
+
 python convert.py --source me.wav --reference alice_1.wav alice_2.wav alice_3.wav --output converted.wav
 ```
 

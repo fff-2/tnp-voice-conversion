@@ -157,7 +157,9 @@ def train(args) -> None:
 
             content_audio = batch["audio_content"].to(device)  # [B, T_content]
             ctx_mels = batch["context_mels"].to(device)  # [B, N_CTX, N_MELS, T_ctx]
-            content_lengths = batch["content_lengths"]  # list[int], unpadded sample counts
+            content_lengths = batch[
+                "content_lengths"
+            ]  # list[int], unpadded sample counts
             ctx_mel_lens = batch["ctx_mel_lens"]  # list[B] of list[N_CTX] ints
 
             B, N, M, T_ctx = ctx_mels.shape
@@ -220,10 +222,6 @@ def train(args) -> None:
                         f0_stats=(0.0, float(pitch_ratio), 0.0, 1.0),
                     )  # [B, T_frames, 769]
 
-                # Information bottleneck: zero out 20% of HuBERT features so the
-                # decoder must use context C for speaker timbre, not leaked identity.
-                content = F.dropout(content, p=0.2, training=model.training)
-
                 # ── Cross-attention + decode ──────────────────────────────────
                 fused = model.cross_attention(
                     content, C, key_padding_mask=ctx_mask
@@ -232,7 +230,9 @@ def train(args) -> None:
 
                 # ── Target mel (always from unperturbed content_audio) ────────
                 with torch.no_grad():
-                    tgt_mel = compute_target_mel(content_audio)  # [B, T_mel_tgt, N_MELS]
+                    tgt_mel = compute_target_mel(
+                        content_audio
+                    )  # [B, T_mel_tgt, N_MELS]
 
                 # ── Masked L1 loss (ignore padded frames) ─────────────────────
                 T = min(pred_mel.shape[1], tgt_mel.shape[1])
@@ -404,7 +404,9 @@ def _validate(
             if model.content_encoder._crepe_available:
                 with torch.no_grad():
                     src_f0 = model.content_encoder._extract_f0(source[0:1, :src_len])
-                    tgt_f0 = model.content_encoder._extract_f0(content_audio[0:1, :tgt_len])
+                    tgt_f0 = model.content_encoder._extract_f0(
+                        content_audio[0:1, :tgt_len]
+                    )
                 src_voiced = src_f0[0, :, 0].cpu().numpy()
                 tgt_voiced = tgt_f0[0, :, 0].cpu().numpy()
                 src_v = src_voiced[src_voiced > 0.0]

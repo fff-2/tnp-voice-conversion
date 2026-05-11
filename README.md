@@ -162,7 +162,8 @@ Training forward pass
 audio_content  ──→  [ContentEncoder (frozen)]  ──→  content features
                          (HuBERT discards speaker acoustics,
                           preserves phonetics)
-                    ──→  content dropout (p=0.2)  ──→  masked features
+                    ──→  HuBERT spatial dropout1d (p=0.1)  ──→  masked features
+                         (F0 channel bypasses dropout)
 
 context_mels   ──→  [ContextEncoder]  ──→  C  (target speaker embedding)
 
@@ -198,8 +199,8 @@ HuBERT layer-6 features are not perfectly speaker-agnostic — some identity lea
 **Mitigation 1 — HuBERT Instance Normalization:**
 The content encoder applies `F.instance_norm` to HuBERT features before the F0 concat. It normalises each `(sample, channel)` pair to mean=0 / std=1 across the time dimension, stripping the per-sample spectral bias that encodes speaker timbre. This is a hard constraint: the model *cannot* reconstruct speaker identity from content features alone and must consult `C` via cross-attention. See the Implementation Notes for technical details.
 
-**Mitigation 2 — Content Dropout (Information Bottleneck):**
-After the content encoder, `F.dropout(content, p=0.2, training=model.training)` randomly zeros 20% of HuBERT feature dimensions each training step. This prevents the decoder from relying on any single feature dimension that happens to carry residual speaker identity — it must use `C` to fill in the missing information. Dropout is automatically disabled during validation (`model.training = False`), so it does not affect the loss metric or audio sample quality at checkpoints.
+**Mitigation 2 — HuBERT Spatial Dropout (Information Bottleneck):**
+After the content encoder, the 769-dimensional content tensor is split into HuBERT features `[B, T_frames, 768]` and F0 `[B, T_frames, 1]`. `F.dropout1d(p=0.1)` is applied to the HuBERT slice only, zeroing entire channels across all time-steps. Unlike frame-level dropout which pokes random holes in individual elements, `dropout1d` eliminates whole temporal channels — if a HuBERT channel encodes persistent speaker timbre across time, zeroing its entire time-axis removes that signal completely. The F0 channel is concatenated back unchanged, preserving the pitch correction applied by the augmentation step. Dropout is automatically disabled during validation (`model.training = False`).
 
 **Mitigation 3 — Random Pitch Perturbation + F0 Feature Shifting:**
 Each training batch, the audio fed to the content encoder is pitch-shifted by a random amount uniformly sampled from **±2 semitones** (probability 0.3) using `torchaudio.functional.pitch_shift`. The target mel is computed from the **original, unshifted audio** — so the model cannot copy pitch from the content features and must recover the correct pitch from `C`.
@@ -613,8 +614,17 @@ Unvoiced frames (f0 == 0) are left unchanged. This shifts the source speaker's p
 **Context encoder — no positional encoding, no mean pooling**
 Speaker identity (timbre, vocal tract shape) is time-invariant. Absolute positional encoding was removed so the model cannot overfit on the temporal position of phonemes in the reference clip. Mean pooling was also removed: `ContextEncoder` now outputs a full sequence `[B, T_ctx, 256]` so `CrossAttentionFusion` can attend over all reference frames (TNP style) rather than collapsing to a single vector where softmax over one key is always 1.0.
 
-**Content dropout — information bottleneck**
-After the frozen content encoder and before cross-attention, the training loop applies `F.dropout(content, p=0.2, training=model.training)`. This zeros 20% of HuBERT feature dimensions per step, preventing the decoder from relying on any residual speaker-identity signal in the content features. Because `model.training` is `False` during `_validate()`, dropout is a no-op at eval time and does not affect the logged validation loss or checkpoint audio samples.
+**HuBERT spatial dropout — information bottleneck**
+After the frozen content encoder and before cross-attention, the training loop splits the `[B, T_frames, 769]` content tensor into HuBERT features `[:, :, :768]` and F0 `[:, :, 768:]`, applies `F.dropout1d` to the HuBERT slice with `p=0.1`, then concatenates F0 back:
+```python
+hubert_feat = F.dropout1d(
+    hubert_feat.transpose(1, 2),   # [B, 768, T_frames]
+    p=0.1,
+    training=model.training,
+).transpose(1, 2)                  # [B, T_frames, 768]
+content = torch.cat([hubert_feat, f0_feat], dim=-1)
+```
+`dropout1d` zeros entire channels across **all** time-steps — if a HuBERT channel encodes persistent speaker timbre (which manifests as a consistent signal across time, not random frame noise), the whole temporal trace of that channel is silenced. Plain `F.dropout` only pokes holes in individual elements, leaving the pattern largely intact. The F0 channel bypasses dropout entirely so the pitch correction applied by the augmentation step is preserved going into cross-attention. The op is a no-op during `model.eval()`, so validation loss and checkpoint audio samples are unaffected.
 
 **Masked L1 loss**
 The training loss is computed only over valid (non-padded) mel frames. `collate_fn` returns `content_lengths` (original audio sample counts for the content clip); the training loop converts these to mel frame counts and builds a boolean mask before calling `F.l1_loss(..., reduction="none")`. Padding regions contain `log(1e-5) ≈ −11.5` and would otherwise waste model capacity if included in the loss.

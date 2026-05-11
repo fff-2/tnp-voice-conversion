@@ -107,7 +107,7 @@ def train(args) -> None:
     # ── Dataset & DataLoader ──────────────────────────────────────────────────
     train_ds = SpeakerDataset(args.data_root, split="train", max_sec=MAX_AUDIO_SEC)
     val_ds = SpeakerDataset(args.data_root, split="val", max_sec=MAX_AUDIO_SEC)
-    val_subset = torch.utils.data.Subset(val_ds, range(50))
+    val_subset = torch.utils.data.Subset(val_ds, range(3, 53))
 
     train_loader = DataLoader(
         train_ds,
@@ -171,7 +171,7 @@ def train(args) -> None:
             # The target mel is computed from the ORIGINAL target so the model
             # must use context C to recover the correct pitch — breaking copy-synthesis.
             if random.random() < 0.3:
-                n_steps = random.uniform(-2.0, 2.0)
+                n_steps = random.uniform(-4.0, 4.0)
                 pitch_ratio = 2.0 ** (n_steps / 12.0)
                 with torch.no_grad():
                     content_shifted = torchaudio.functional.pitch_shift(
@@ -221,6 +221,22 @@ def train(args) -> None:
                         content_shifted,
                         f0_stats=(0.0, float(pitch_ratio), 0.0, 1.0),
                     )  # [B, T_frames, 769]
+
+                # ── HuBERT spatial dropout (information bottleneck) ───────────
+                # dropout1d zeros whole time-steps per channel, destroying any
+                # speaker-identity signal that persists across time rather than
+                # corrupting individual frames. F0 (last dim) is left intact so
+                # the pitch correction from the augmentation step is preserved.
+                hubert_feat = content[..., :768]  # [B, T_frames, 768]
+                f0_feat = content[..., 768:]  # [B, T_frames, 1]
+                hubert_feat = F.dropout1d(
+                    hubert_feat.transpose(1, 2),  # [B, 768, T_frames]
+                    p=0.3,
+                    training=model.training,
+                ).transpose(1, 2)  # [B, T_frames, 768]
+                content = torch.cat(
+                    [hubert_feat, f0_feat], dim=-1
+                )  # [B, T_frames, 769]
 
                 # ── Cross-attention + decode ──────────────────────────────────
                 fused = model.cross_attention(

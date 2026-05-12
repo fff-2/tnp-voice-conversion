@@ -9,24 +9,24 @@ class ContinuousPitchEmbedding(nn.Module):
         # d_model must be even
         inv_freq = 1.0 / (10000 ** (torch.arange(0, d_model, 2).float() / d_model))
         self.register_buffer("inv_freq", inv_freq)
-        
+
         # MLP to map sine/cosine waves into a learnable non-linear space
         self.mlp = nn.Sequential(
-            nn.Linear(d_model, d_model),
-            nn.SiLU(),
-            nn.Linear(d_model, d_model)
+            nn.Linear(d_model, d_model), nn.SiLU(), nn.Linear(d_model, d_model)
         )
 
     def forward(self, x: Tensor) -> Tensor:
         # x: [B, T, 1] (log1p(f0) values, 0 ~ 7.6)
-        
+
         # Scale-up: expand dynamic range so waves oscillate nicely across dimensions
-        x_scaled = x * 1000.0  
-        
+        x_scaled = x * 10.0
+
         # Sinusoidal transformation
         sinusoid_inp = x_scaled * self.inv_freq  # [B, T, d_model//2]
-        emb = torch.cat([sinusoid_inp.sin(), sinusoid_inp.cos()], dim=-1) # [B, T, d_model]
-        
+        emb = torch.cat(
+            [sinusoid_inp.sin(), sinusoid_inp.cos()], dim=-1
+        )  # [B, T, d_model]
+
         # Non-linear mapping
         return self.mlp(emb)
 
@@ -42,17 +42,17 @@ class CrossAttentionFusion(nn.Module):
     def __init__(
         self,
         hubert_dim: int = 768,
-        f0_dim: int = 1, # Kept for signature compatibility
+        f0_dim: int = 1,  # Kept for signature compatibility
         d_model: int = 256,
         nhead: int = 4,
         dropout: float = 0.1,
     ) -> None:
         super().__init__()
         self.hubert_proj = nn.Linear(hubert_dim, d_model)
-        
+
         # Replace weak Linear with powerful ContinuousPitchEmbedding
         self.f0_embed = ContinuousPitchEmbedding(d_model=d_model)
-        
+
         self.attn = nn.MultiheadAttention(
             embed_dim=d_model,
             num_heads=nhead,
@@ -86,17 +86,19 @@ class CrossAttentionFusion(nn.Module):
         """
         hubert_feat = content[..., :768]
         f0_feat = content[..., 768:]
-        
+
         # Pitch embedding now provides rich non-linear harmonics in the 256-d space
-        Q = self.hubert_proj(hubert_feat) + self.f0_embed(f0_feat) # [B, T_frames, d_model]
-        
+        Q = self.hubert_proj(hubert_feat) + self.f0_embed(
+            f0_feat
+        )  # [B, T_frames, d_model]
+
         attn_out, _ = self.attn(
             query=Q,
             key=C,
             value=C,
             need_weights=False,
             key_padding_mask=key_padding_mask,  # masks zero-padded context frames
-        )                                  # [B, T_frames, d_model]
-        x = self.out_norm(Q + attn_out)    # [B, T_frames, d_model]
-        x = self.ffn_norm(x + self.ffn(x)) # [B, T_frames, d_model]
+        )  # [B, T_frames, d_model]
+        x = self.out_norm(Q + attn_out)  # [B, T_frames, d_model]
+        x = self.ffn_norm(x + self.ffn(x))  # [B, T_frames, d_model]
         return x

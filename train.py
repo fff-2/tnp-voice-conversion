@@ -53,15 +53,11 @@ N_CTX = 5  # number of context utterances per training sample
 N_MELS = 100
 
 # ── KL annealing schedule ──────────────────────────────────────────────────────
-# beta=0 for the first KL_ANNEAL_START steps (pure reconstruction warmup),
+# beta=1e-6 for the first KL_ANNEAL_START steps (pure reconstruction warmup),
 # then linearly ramps to KL_BETA_MAX by KL_ANNEAL_END.  Prevents posterior collapse.
 KL_ANNEAL_START = 5_000
-KL_ANNEAL_END = 20_000
+KL_ANNEAL_END = 30_000
 KL_BETA_MAX = 0.01
-
-HUBERT_NOISE_STD = (
-    0.01  # std of additive Gaussian noise on HuBERT features (training only)
-)
 
 
 # ── LR schedule: linear warmup → cosine decay ────────────────────────────────
@@ -77,7 +73,7 @@ def get_lr(step: int, warmup: int, max_steps: int, base_lr: float) -> float:
 def get_beta(step: int) -> float:
     """Linear KL annealing: 0 → KL_BETA_MAX over [KL_ANNEAL_START, KL_ANNEAL_END]."""
     if step < KL_ANNEAL_START:
-        return 0.0
+        return 1e-6
     if step >= KL_ANNEAL_END:
         return KL_BETA_MAX
     return KL_BETA_MAX * (step - KL_ANNEAL_START) / (KL_ANNEAL_END - KL_ANNEAL_START)
@@ -249,14 +245,14 @@ def train(args) -> None:
                     content = model.content_encoder(
                         source_audio,
                         f0_audio_16k=content_audio,
-                        lengths=content_lengths
+                        lengths=content_lengths,
                     )  # [B, T_frames, 769]
 
                 # ── Cross-attention + decode ──────────────────────────────────
                 fused = model.cross_attention(
                     content, C, key_padding_mask=ctx_mask
                 )  # [B, T_frames, d_model]
-                
+
                 # Content padding mask for the decoder self-attention
                 T_frames = fused.shape[1]
                 content_mask = torch.zeros(B, T_frames, dtype=torch.bool, device=device)
@@ -264,8 +260,10 @@ def train(args) -> None:
                     flen = (L // 320) + 1
                     if flen < T_frames:
                         content_mask[i, flen:] = True
-                        
-                pred_mel = model.decoder(fused, key_padding_mask=content_mask)  # [B, T_mel_pred, N_MELS]
+
+                pred_mel = model.decoder(
+                    fused, key_padding_mask=content_mask
+                )  # [B, T_mel_pred, N_MELS]
 
                 # ── Target mel (always from unperturbed content_audio) ────────
                 with torch.no_grad():
@@ -378,7 +376,7 @@ def _validate(
     for batch in loader:
         source = batch["source_audio"].to(device)
         content_audio = batch["audio_content"].to(device)
-        
+
         B_val = source.shape[0]
         model.content_encoder.reset_dfn_state(batch_size=B_val)
 
@@ -413,14 +411,14 @@ def _validate(
 
             content = model.content_encoder(content_audio, lengths=content_lengths)
             fused = model.cross_attention(content, C, key_padding_mask=ctx_mask)
-            
+
             T_frames = fused.shape[1]
             content_mask = torch.zeros(B, T_frames, dtype=torch.bool, device=device)
             for i, L in enumerate(content_lengths):
                 flen = (L // 320) + 1
                 if flen < T_frames:
                     content_mask[i, flen:] = True
-                    
+
             pred_mel = model.decoder(fused, key_padding_mask=content_mask)
             tgt_mel = mel_transform(mel_resampler(content_audio)).transpose(1, 2)
             tgt_mel = torch.log(tgt_mel.clamp(min=1e-7))

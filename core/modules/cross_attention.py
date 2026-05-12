@@ -3,32 +3,56 @@ import torch.nn as nn
 from torch import Tensor
 
 
+class ContinuousPitchEmbedding(nn.Module):
+    def __init__(self, d_model: int):
+        super().__init__()
+        # d_model must be even
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, d_model, 2).float() / d_model))
+        self.register_buffer("inv_freq", inv_freq)
+        
+        # MLP to map sine/cosine waves into a learnable non-linear space
+        self.mlp = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.SiLU(),
+            nn.Linear(d_model, d_model)
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        # x: [B, T, 1] (log1p(f0) values, 0 ~ 7.6)
+        
+        # Scale-up: expand dynamic range so waves oscillate nicely across dimensions
+        x_scaled = x * 1000.0  
+        
+        # Sinusoidal transformation
+        sinusoid_inp = x_scaled * self.inv_freq  # [B, T, d_model//2]
+        emb = torch.cat([sinusoid_inp.sin(), sinusoid_inp.cos()], dim=-1) # [B, T, d_model]
+        
+        # Non-linear mapping
+        return self.mlp(emb)
+
+
 class CrossAttentionFusion(nn.Module):
     """
     Single cross-attention block fusing source content with target context.
 
       Q = projected source content   [B, T_frames, d_model]
       K = V = context sequence C     [B, T_ctx, d_model]
-
-    Fix 1 — C is now a full sequence of reference frames [B, T_ctx, d_model]
-    rather than a single pooled vector. Softmax over T_ctx > 1 makes attention
-    weights meaningful: each content frame learns to attend to the most relevant
-    reference frames for speaker conditioning.
-
-    Trainable.
     """
 
     def __init__(
         self,
         hubert_dim: int = 768,
-        f0_dim: int = 1,
+        f0_dim: int = 1, # Kept for signature compatibility
         d_model: int = 256,
         nhead: int = 4,
         dropout: float = 0.1,
     ) -> None:
         super().__init__()
         self.hubert_proj = nn.Linear(hubert_dim, d_model)
-        self.f0_proj = nn.Linear(f0_dim, d_model)
+        
+        # Replace weak Linear with powerful ContinuousPitchEmbedding
+        self.f0_embed = ContinuousPitchEmbedding(d_model=d_model)
+        
         self.attn = nn.MultiheadAttention(
             embed_dim=d_model,
             num_heads=nhead,
@@ -62,7 +86,10 @@ class CrossAttentionFusion(nn.Module):
         """
         hubert_feat = content[..., :768]
         f0_feat = content[..., 768:]
-        Q = self.hubert_proj(hubert_feat) + self.f0_proj(f0_feat) # [B, T_frames, d_model]
+        
+        # Pitch embedding now provides rich non-linear harmonics in the 256-d space
+        Q = self.hubert_proj(hubert_feat) + self.f0_embed(f0_feat) # [B, T_frames, d_model]
+        
         attn_out, _ = self.attn(
             query=Q,
             key=C,

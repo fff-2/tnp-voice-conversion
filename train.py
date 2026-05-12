@@ -482,6 +482,7 @@ def _validate(
             with torch.amp.autocast(
                 "cuda", dtype=torch.bfloat16, enabled=(device.type == "cuda")
             ):
+                model.content_encoder.reset_dfn_state(batch_size=1)
                 src_content = model.content_encoder(
                     source[0:1, :src_len], f0_stats=sample_f0_stats
                 )

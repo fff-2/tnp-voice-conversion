@@ -3,17 +3,18 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchaudio
 import torchaudio.functional as AF
-import numpy as np
 from torch import Tensor
 
 try:
     import torchcrepe
+
     _CREPE_AVAILABLE = True
 except ImportError:
     _CREPE_AVAILABLE = False
 
 try:
     from df.enhance import enhance, init_df
+
     _DFN_AVAILABLE = True
 except ImportError:
     _DFN_AVAILABLE = False
@@ -37,8 +38,8 @@ class ContentEncoder(nn.Module):
 
     SR_DFN = 48_000
     SR_HUB = 16_000
-    HUBERT_LAYER_IDX = 5   # 0-based index into extract_features list → layer 6
-    HOP = 320              # samples @ 16kHz; 20ms; matches HuBERT frame stride
+    HUBERT_LAYER_IDX = 5  # 0-based index into extract_features list → layer 6
+    HOP = 320  # samples @ 16kHz; 20ms; matches HuBERT frame stride
 
     def __init__(self, device: torch.device) -> None:
         super().__init__()
@@ -85,7 +86,7 @@ class ContentEncoder(nn.Module):
             denoised:  [B, T]  same shape, denoised
         """
         if self.dfn_model is None or self.dfn_state is None:
-            return audio_16k   # passthrough if DFN not installed
+            return audio_16k  # passthrough if DFN not installed
 
         B, T = audio_16k.shape
         # Resample 16k → 48k for DFN
@@ -114,12 +115,20 @@ class ContentEncoder(nn.Module):
         # extract_features returns (list_of_layer_features, lengths)
         # list has 12 elements for HUBERT_BASE (one per transformer layer)
         features_list, _ = self.hubert.extract_features(audio_16k)
-        return features_list[self.HUBERT_LAYER_IDX]   # [B, T_frames, 768]
+        return features_list[self.HUBERT_LAYER_IDX]  # [B, T_frames, 768]
+
+    PERIODICITY_THRESHOLD = 0.5  # frames below this confidence are treated as unvoiced
 
     @torch.no_grad()
     def _extract_f0(self, audio_16k: Tensor) -> Tensor:
         """
-        Extract fundamental frequency with torchcrepe.
+        Extract fundamental frequency with torchcrepe + periodicity filtering.
+
+        The argmax decoder always returns a pitch value, even for unvoiced or
+        noisy frames.  Without periodicity filtering this causes octave errors
+        (e.g. 650 Hz instead of the true ~160 Hz) and inflated statistics.
+        Frames with periodicity below PERIODICITY_THRESHOLD are set to 0.0
+        (unvoiced).
 
         Args:
             audio_16k: [B, T]  16 kHz mono
@@ -132,21 +141,23 @@ class ContentEncoder(nn.Module):
             T_frames = (audio_16k.shape[-1] // self.HOP) + 1
             return torch.zeros(B, T_frames, 1, device=self.device)
 
-        pitch = torchcrepe.predict(
+        pitch, periodicity = torchcrepe.predict(
             audio_16k,
             sample_rate=self.SR_HUB,
             hop_length=self.HOP,
             fmin=50.0,
-            fmax=2006.0,
-            model="tiny",                          # fast inference
-            decoder=torchcrepe.decode.argmax,      # Fix 3: frame-independent, causal
-            return_periodicity=False,
+            fmax=550.0,  # speech range (avoids harmonic/octave errors)
+            model="tiny",  # fast inference
+            decoder=torchcrepe.decode.argmax,
+            return_periodicity=True,
             batch_size=None,
             device=self.device,
             pad=True,
-        )                                          # [B, T_frames]
-        pitch = torch.nan_to_num(pitch, nan=0.0)   # 0.0 for unvoiced frames
-        return pitch.unsqueeze(-1)                 # [B, T_frames, 1]
+        )  # pitch: [B, T_frames], periodicity: [B, T_frames]
+        pitch = torch.nan_to_num(pitch, nan=0.0)
+        # Zero out low-confidence frames (unvoiced / noisy)
+        pitch = torch.where(periodicity >= self.PERIODICITY_THRESHOLD, pitch, torch.zeros_like(pitch))
+        return pitch.unsqueeze(-1)  # [B, T_frames, 1]
 
     def forward(
         self,
@@ -178,10 +189,10 @@ class ContentEncoder(nn.Module):
         if skip_denoise:
             audio = audio_16k
         else:
-            audio = self._denoise(audio_16k)           # [B, T]
+            audio = self._denoise(audio_16k)  # [B, T]
 
         # Step 2: HuBERT features
-        hubert_feat = self._extract_hubert(audio)      # [B, T_frames, 768]
+        hubert_feat = self._extract_hubert(audio)  # [B, T_frames, 768]
 
         # Step 3: F0
         if f0_audio_16k is not None:
@@ -190,7 +201,7 @@ class ContentEncoder(nn.Module):
             f0_audio = f0_audio_16k if skip_denoise else self._denoise(f0_audio_16k)
             f0 = self._extract_f0(f0_audio)
         else:
-            f0 = self._extract_f0(audio)                   # [B, T_frames, 1]
+            f0 = self._extract_f0(audio)  # [B, T_frames, 1]
 
         # Align lengths (HuBERT and crepe may differ by 1 frame at chunk edges)
         T = min(hubert_feat.shape[1], f0.shape[1])
@@ -203,31 +214,37 @@ class ContentEncoder(nn.Module):
         # Streaming: only 8 frames → instance_norm statistics are wildly unstable,
         #   especially during silence. Use caller-provided EMA statistics instead.
         if hubert_stats is not None:
-            hub_mean, hub_std = hubert_stats   # [1, 1, 768] each, broadcast over [B, T, 768]
+            hub_mean, hub_std = (
+                hubert_stats  # [1, 1, 768] each, broadcast over [B, T, 768]
+            )
             hubert_norm = (hubert_feat - hub_mean) / (hub_std + 1e-5)
         elif lengths is not None:
             # Masked instance normalization (prevents zero-padding from contaminating stats)
             B, T_frames, C_dim = hubert_feat.shape
             # Calculate valid frame lengths (matches torchaudio hubert stride 320)
             frame_lengths = [(L // self.HOP) + 1 for L in lengths]
-            
+
             mask = torch.zeros(B, T_frames, device=hubert_feat.device, dtype=torch.bool)
             for i, flen in enumerate(frame_lengths):
-                mask[i, :min(flen, T_frames)] = True
-                
+                mask[i, : min(flen, T_frames)] = True
+
             hub_masked = hubert_feat * mask.unsqueeze(-1)
-            count = mask.sum(dim=1, keepdim=True).unsqueeze(-1).clamp(min=1)  # [B, 1, 1]
-            
-            hub_mean = hub_masked.sum(dim=1, keepdim=True) / count            # [B, 1, 768]
-            hub_var = (((hubert_feat - hub_mean) ** 2) * mask.unsqueeze(-1)).sum(dim=1, keepdim=True) / count
-            hub_std = torch.sqrt(hub_var + 1e-5)                              # [B, 1, 768]
-            
+            count = (
+                mask.sum(dim=1, keepdim=True).unsqueeze(-1).clamp(min=1)
+            )  # [B, 1, 1]
+
+            hub_mean = hub_masked.sum(dim=1, keepdim=True) / count  # [B, 1, 768]
+            hub_var = (((hubert_feat - hub_mean) ** 2) * mask.unsqueeze(-1)).sum(
+                dim=1, keepdim=True
+            ) / count
+            hub_std = torch.sqrt(hub_var + 1e-5)  # [B, 1, 768]
+
             hubert_norm = (hubert_feat - hub_mean) / hub_std
             hubert_norm = hubert_norm * mask.unsqueeze(-1)  # Re-zero the padding area
         else:
             hubert_norm = F.instance_norm(
-                hubert_feat.transpose(1, 2)    # [B, 768, T]
-            ).transpose(1, 2)                  # [B, T, 768]
+                hubert_feat.transpose(1, 2)  # [B, 768, T]
+            ).transpose(1, 2)  # [B, T, 768]
 
         # Step 5: F0 speaker normalisation then log-scale.
         # Training: no shift — source and target are the same utterance (self-reconstruction).
@@ -239,10 +256,10 @@ class ContentEncoder(nn.Module):
             voiced_mask = (f0 > 0.0).float()
             f0_shifted = (f0 - src_mean) / (src_std + 1e-5) * tgt_std + tgt_mean
             # clamp_min=0 prevents negative pitch; unvoiced frames keep original 0.0
-            f0 = voiced_mask * f0_shifted.clamp(min=0.0) + (1.0 - voiced_mask) * f0
+            f0 = voiced_mask * f0_shifted.clamp(min=50.0) + (1.0 - voiced_mask) * f0
 
-        f0 = torch.log1p(f0)                           # [0, 2006] Hz → [0, ~7.6]
-        content = torch.cat([hubert_norm, f0], dim=-1) # [B, T_frames, 769]
+        f0 = torch.log1p(f0)  # [0, 2006] Hz → [0, ~7.6]
+        content = torch.cat([hubert_norm, f0], dim=-1)  # [B, T_frames, 769]
         return content
 
     @torch.no_grad()
@@ -267,8 +284,8 @@ class ContentEncoder(nn.Module):
             hub_std:  [1, 768]  per-channel std  (clamped ≥ 1e-4)
             f0:       [1, T_frames, 1]  raw F0 in Hz  (0.0 = unvoiced)
         """
-        hub = self._extract_hubert(audio_16k)              # [1, T, 768]
-        hub_mean = hub.mean(dim=1)                         # [1, 768]
-        hub_std = hub.std(dim=1).clamp(min=1e-4)           # [1, 768]
-        f0 = self._extract_f0(audio_16k)                   # [1, T, 1]
+        hub = self._extract_hubert(audio_16k)  # [1, T, 768]
+        hub_mean = hub.mean(dim=1)  # [1, 768]
+        hub_std = hub.std(dim=1).clamp(min=1e-4)  # [1, 768]
+        f0 = self._extract_f0(audio_16k)  # [1, T, 1]
         return hub_mean, hub_std, f0

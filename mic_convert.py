@@ -4,28 +4,21 @@ Real-time microphone voice conversion — no server needed.
 Phase 1: Record the target speaker's voice from the microphone (or load a WAV).
 Phase 2: Stream your own microphone in real-time → converted to target speaker's voice.
 
-Install audio backend:
-    pip install sounddevice
-    # WSL2 (if no audio):  sudo apt install libportaudio2 pulseaudio
-    # Windows:             pip install sounddevice  (PortAudio included)
-
 Usage:
-    # Record 5s of target voice from mic, then start converting:
     python mic_convert.py --checkpoint checkpoints/best.pt
-
-    # Use an existing WAV as reference instead of recording:
+    python mic_convert.py --checkpoint checkpoints/best.pt --pa        # WSL2 / WSLg
     python mic_convert.py --checkpoint checkpoints/best.pt --reference alice.wav
-
-    # List audio devices to find the right device index:
-    python mic_convert.py --list-devices
+    python mic_convert.py --list-devices [--pa]
 """
 
 import argparse
+import fcntl
+import os
 import queue
+import subprocess
 import sys
 import threading
 import time
-from collections import deque
 from pathlib import Path
 
 import numpy as np
@@ -36,58 +29,60 @@ import torchaudio.functional as AF
 
 try:
     import sounddevice as sd
+
+    _SD_AVAILABLE = True
 except ImportError:
-    print("sounddevice not found.")
-    print("  Install: pip install sounddevice")
-    print("  WSL2:    sudo apt install libportaudio2 && pip install sounddevice")
-    sys.exit(1)
+    _SD_AVAILABLE = False
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from core.model import VoiceConversionModel
 
-# ── Constants ─────────────────────────────────────────────────────────────────
-
+# ── Audio ──────────────────────────────────────────────────────────────────────
 SR = 16_000
-VOCODER_SR = 24_000   # vocos output sample rate; output is resampled back to SR for playback
+VOCODER_SR = 24_000
 N_MELS = 100
-CHUNK = 1024          # samples per audio callback frame  (~64 ms)
 
-# Bug 1 fix — choose PROC_SAMPLES so the full pipeline produces an exact integer
-# number of output samples with no accumulating drift:
-#   2560 / HOP=320 = 8 HuBERT frames
-#   8 × upsample=1.875 = 15 Vocos mel frames  (exact integer — no floor rounding)
-#   15 × hop_length=256 = 3840 samples @ 24 kHz
-#   3840 × (16 000 / 24 000) = 2560 samples @ 16 kHz  ← equals PROC_SAMPLES ✓
-PROC_SAMPLES = 2560
+# ── Streaming ─────────────────────────────────────────────────────────────────
+# BLOCK / 320 = 15 HuBERT frames.  15 × 1.875 = 28.125 mel frames.
+# We round to 28 mel frames → 28 × 256 = 7168 samples @ 24 kHz.
+BLOCK = 4800           # new samples per iteration (300 ms @ 16 kHz, 15 HuBERT frames)
+BLOCK_FRAMES = BLOCK // 320   # 15 HuBERT frames per block
 
-# OVERLAP is kept for HuBERT edge quality (left-context reduces boundary artefacts),
-# but DFN now only sees the non-overlapping chunk (see Bug 2 fix below).
-#   1280 / HOP=320 = 4 HuBERT frames — trimmed from content before the decoder so
-#   the decoder always receives exactly 8 new frames regardless of overlap size.
-OVERLAP = 1280
-OVERLAP_HUB_FRAMES = OVERLAP // 320   # = 4 content frames to discard after HuBERT
+# Ring buffer: keep ~1.5 s of denoised history so HuBERT has enough context.
+# Total window fed to HuBERT = RING_SIZE.  Only the last BLOCK_FRAMES frames
+# from HuBERT output are forwarded to decoder/vocoder (RVC skip_head pattern).
+RING_SAMPLES = 16000   # 1.0 s @ 16 kHz (enough HuBERT context, lower latency)
+RING_FRAMES = RING_SAMPLES // 320   # 50 HuBERT frames of context
 
-JITTER_TARGET = 5     # chunks to pre-buffer before playback starts
+# SOLA (Similarity Overlap-Add) crossfade — finds optimal overlap position
+# for smooth chunk boundaries (technique from RVC GUI).
+SOLA_SEARCH = 320      # search window for best overlap (samples @ 16 kHz, 20 ms)
+SOLA_OVERLAP = 640     # overlap region for crossfade (samples @ 16 kHz, 40 ms)
 
-# ── Streaming normalisation constants ─────────────────────────────────────────
-# HuBERT instance_norm collapses on 8-frame chunks (silence gives near-zero std).
-# Instead, maintain an EMA of per-channel statistics over the last ~3 seconds and
-# use that for normalization once the EMA has warmed up.
-EMA_MOMENTUM  = 0.95  # per-chunk decay; at 160 ms/chunk, τ ≈ 3 s
-STATS_WARMUP  = 15    # chunks (~2.4 s) before EMA stats replace instance_norm
+CHUNK = 960            # I/O granularity (60 ms)
+JITTER_TARGET = 1      # chunks to pre-buffer before playback (lower = less latency)
+
+# ── EMA normalisation ─────────────────────────────────────────────────────────
+EMA_MOMENTUM = 0.95
 
 
-# ── Audio helpers ─────────────────────────────────────────────────────────────
-
-def list_devices() -> None:
-    print(sd.query_devices())
+# ── Audio helpers ──────────────────────────────────────────────────────────────
 
 
-def record_reference(seconds: int, device_in=None) -> np.ndarray:
-    """
-    Record `seconds` of audio from the microphone.
-    Returns float32 mono numpy array [T] @ SR.
-    """
+def list_devices(use_pa: bool = False) -> None:
+    if use_pa:
+        print("=== Input sources ===")
+        subprocess.run(["pactl", "list", "sources", "short"])
+        print("\n=== Output sinks ===")
+        subprocess.run(["pactl", "list", "sinks", "short"])
+    else:
+        if not _SD_AVAILABLE:
+            print("sounddevice not available — use --pa for PulseAudio devices")
+            return
+        print(sd.query_devices())
+
+
+def _countdown(seconds: int) -> None:
     print(f"\n[REF] Will record {seconds}s of target speaker voice.")
     print("[REF] Get ready …", end="", flush=True)
     for i in range(3, 0, -1):
@@ -95,58 +90,84 @@ def record_reference(seconds: int, device_in=None) -> np.ndarray:
         print(f" {i}", end="", flush=True)
     print("\n[REF] *** SPEAK NOW ***", flush=True)
 
+
+def record_reference(seconds: int, device_in=None) -> np.ndarray:
+    """Record via sounddevice → float32 mono [T] @ SR."""
+    _countdown(seconds)
     audio = sd.rec(
-        int(seconds * SR),
-        samplerate=SR,
-        channels=1,
-        dtype="float32",
-        device=device_in,
+        int(seconds * SR), samplerate=SR, channels=1, dtype="float32", device=device_in
     )
-    # Progress bar while recording
     for elapsed in range(seconds):
         time.sleep(1)
         bar = "█" * (elapsed + 1) + "░" * (seconds - elapsed - 1)
-        print(f"\r[REF] [{bar}] {elapsed+1}/{seconds}s", end="", flush=True)
+        print(f"\r[REF] [{bar}] {elapsed + 1}/{seconds}s", end="", flush=True)
     sd.wait()
     print("\n[REF] Recording done.")
-    return audio.squeeze()   # [T]
+    return audio.squeeze()
+
+
+def record_reference_pa(seconds: int, device_in: str | None = None) -> np.ndarray:
+    """Record via parec (PulseAudio) → float32 mono [T] @ SR."""
+    _countdown(seconds)
+    cmd = ["parec", "--channels=1", f"--rate={SR}", "--format=float32le"]
+    if device_in:
+        cmd += ["--device", device_in]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE)
+    chunks: list[bytes] = []
+    try:
+        for elapsed in range(seconds):
+            chunks.append(proc.stdout.read(SR * 4))  # 1 s of float32
+            bar = "█" * (elapsed + 1) + "░" * (seconds - elapsed - 1)
+            print(f"\r[REF] [{bar}] {elapsed + 1}/{seconds}s", end="", flush=True)
+    finally:
+        proc.terminate()
+        proc.wait()
+    print("\n[REF] Recording done.")
+    return np.frombuffer(b"".join(chunks), dtype=np.float32).copy()
 
 
 def load_wav_reference(path: str, device: torch.device) -> torch.Tensor:
-    """Load a WAV file → mono float32 tensor [1, T] @ SR on device."""
+    """WAV file → mono float32 [1, T] @ SR on device."""
     data, sr = sf.read(str(path), dtype="float32", always_2d=True)
-    wav = torch.from_numpy(data.T)           # [C, T]
+    wav = torch.from_numpy(data.T)
     if wav.shape[0] > 1:
         wav = wav.mean(0, keepdim=True)
     if sr != SR:
         wav = AF.resample(wav, sr, SR)
-    return wav.to(device)    # [1, T]
+    return wav.to(device)
 
 
 def audio_to_mel(audio: torch.Tensor, device: torch.device) -> torch.Tensor:
-    """[1, T @ 16kHz] → [1, N_MELS, T_mel] log mel at 24000 Hz."""
+    """[1, T @ 16 kHz] → [1, N_MELS, T_mel] log-mel @ 24 kHz."""
     audio_24k = AF.resample(audio, SR, VOCODER_SR)
     tf = torchaudio.transforms.MelSpectrogram(
-        sample_rate=VOCODER_SR, n_fft=1024, hop_length=256, win_length=1024, n_mels=N_MELS, power=1.0, center=True,
+        sample_rate=VOCODER_SR,
+        n_fft=1024,
+        hop_length=256,
+        win_length=1024,
+        n_mels=N_MELS,
+        power=1.0,
+        center=True,
     ).to(device)
-    mel = tf(audio_24k)
-    return torch.log(mel.clamp(min=1e-7))
+    return torch.log(tf(audio_24k).clamp(min=1e-7))
 
 
-# ── Real-time converter ───────────────────────────────────────────────────────
+# ── Real-time converter ────────────────────────────────────────────────────────
+
 
 class RealtimeConverter:
     """
-    Two-thread real-time voice conversion pipeline.
+    Streaming voice conversion — simplified.
 
-    Thread 1 (sounddevice callback, called by PortAudio):
-        - Writes incoming mic samples to mic_queue
-        - Reads from out_deque and writes to speaker output
+    Uses model.convert_chunk() directly (same code path as convert.py).
+    No ring buffer, no EMA, no separate feature extraction.
+    DFN GRU state is maintained automatically across blocks.
 
-    Thread 2 (processing_thread):
-        - Drains mic_queue, accumulates to PROC_SAMPLES
-        - Runs model.convert_chunk()
-        - Pushes output chunks into out_deque (jitter buffer)
+    Per-block pipeline:
+      1. convert_chunk(block, C, f0_stats)  — full pipeline in one call
+      2. Resample 24 kHz → 16 kHz
+      3. Linear crossfade at boundaries
+      4. Write to output
     """
 
     def __init__(
@@ -155,303 +176,199 @@ class RealtimeConverter:
         C: torch.Tensor,
         device: torch.device,
         ref_audio: torch.Tensor | None = None,
-        device_in=None,
-        device_out=None,
     ) -> None:
         self.model = model
         self.C = C
-        self.torch_device = device
-        self.device_in = device_in
-        self.device_out = device_out
+        self.dev = device
 
-        self.mic_queue: queue.Queue[np.ndarray] = queue.Queue(maxsize=60)
-        self.out_deque: deque[np.ndarray] = deque(maxlen=JITTER_TARGET * 3)
-
-        self._ready = threading.Event()   # set once jitter buffer is pre-filled
+        self.mic_q: queue.Queue[np.ndarray] = queue.Queue(maxsize=60)
+        self.out_q: queue.Queue[np.ndarray] = queue.Queue(maxsize=30)
+        self._ready = threading.Event()
         self._stop = threading.Event()
 
-        self._accum = np.zeros(0, dtype=np.float32)   # mic accumulation buffer
-        # Stores the denoised tail of the previous chunk (DFN GRU state isolation).
-        self._prev_denoised = np.zeros(OVERLAP, dtype=np.float32)
-        self._pre_fill_count = 0
+        # Crossfade state
+        self._xfade_buf = np.zeros(SOLA_OVERLAP, dtype=np.float32)
+        self._fade_in = np.linspace(0.0, 1.0, SOLA_OVERLAP, dtype=np.float32)
+        self._fade_out = 1.0 - self._fade_in
 
-        # ── Streaming normalisation EMA state ─────────────────────────────────
-        # HuBERT channel statistics — shapes match [768] channels.
-        # Initialised to mean=0, std=1 (neutral); replaced by EMA after warmup.
-        self._hub_ema_mean = np.zeros(768, dtype=np.float32)
-        self._hub_ema_std  = np.ones(768,  dtype=np.float32)
-        # Source speaker F0 EMA (Hz, voiced frames only)
-        self._src_f0_ema_mean: float = 0.0
-        self._src_f0_ema_std:  float = 1.0
-        # Target speaker F0 stats (computed once from reference audio)
+        # F0 stats
+        self._src_f0_mean: float = 0.0
+        self._src_f0_std: float = 1.0
         self.tgt_f0_mean: float = 0.0
-        self.tgt_f0_std:  float = 1.0
-        self._stats_chunks: int = 0
+        self.tgt_f0_std: float = 1.0
+        self._n_chunks: int = 0
 
         if ref_audio is not None:
-            self._init_speaker_stats(ref_audio)
+            self._init_target_stats(ref_audio)
 
-    # ── Speaker stats initialisation ──────────────────────────────────────────
-
-    def _init_speaker_stats(self, ref_audio: torch.Tensor) -> None:
-        """
-        Extract target-speaker F0 statistics from reference audio.
-        Called once at startup; sets tgt_f0_mean / tgt_f0_std for use during streaming.
-
-        Args:
-            ref_audio: [1, T]  reference waveform at SR (16 kHz) on the model's device
-        """
+    def _init_target_stats(self, ref_audio: torch.Tensor) -> None:
         if not self.model.content_encoder._crepe_available:
             print("[REF] torchcrepe not available — F0 shifting disabled")
             return
-
         with torch.no_grad():
-            f0_t = self.model.content_encoder._extract_f0(ref_audio)  # [1, T_frames, 1]
-        f0_np = f0_t[0, :, 0].cpu().numpy()   # [T_frames]
-        voiced = f0_np > 0.0
+            f0_t = self.model.content_encoder._extract_f0(ref_audio)
+        f0 = f0_t[0, :, 0].cpu().numpy()
+        voiced = f0 > 0.0
         if voiced.sum() > 1:
-            self.tgt_f0_mean = float(f0_np[voiced].mean())
-            self.tgt_f0_std  = float(f0_np[voiced].std())
-            print(
-                f"[REF] Target F0: mean={self.tgt_f0_mean:.1f} Hz, "
-                f"std={self.tgt_f0_std:.1f} Hz"
-            )
-        else:
-            print("[REF] No voiced frames in reference — F0 shifting disabled")
+            self.tgt_f0_mean = float(f0[voiced].mean())
+            self.tgt_f0_std = float(max(f0[voiced].std(), 5.0))
+            print(f"[REF] Target F0: {self.tgt_f0_mean:.1f} ± {self.tgt_f0_std:.1f} Hz")
 
-    # ── Per-chunk EMA update ──────────────────────────────────────────────────
-
-    def _update_stats_ema(
-        self,
-        hub_mean_t: torch.Tensor,   # [1, 768]
-        hub_std_t:  torch.Tensor,   # [1, 768]
-        f0_t:       torch.Tensor,   # [1, T_frames, 1]
-    ) -> None:
-        """Update EMA statistics from the current chunk's raw features."""
-        hub_mean_np = hub_mean_t[0].cpu().numpy()            # [768]
-        hub_std_np  = hub_std_t[0].cpu().numpy()             # [768]
-        
-        # Initialize EMA on the first chunk to prevent warmup bias
-        if self._stats_chunks == 0:
-            self._hub_ema_mean = hub_mean_np.copy()
-            self._hub_ema_std = hub_std_np.copy()
-        else:
-            self._hub_ema_mean = (
-                EMA_MOMENTUM * self._hub_ema_mean + (1.0 - EMA_MOMENTUM) * hub_mean_np
-            )
-            self._hub_ema_std = (
-                EMA_MOMENTUM * self._hub_ema_std  + (1.0 - EMA_MOMENTUM) * hub_std_np
-            )
-
-        f0_np = f0_t[0, :, 0].cpu().numpy()                 # [T_frames]
-        voiced = f0_np > 0.0
-        if voiced.sum() > 1:
-            chunk_f0_mean = float(f0_np[voiced].mean())
-            chunk_f0_std  = float(f0_np[voiced].std())
-            
-            # Initialize F0 EMA on the first voiced chunk
-            if self._src_f0_ema_mean == 0.0:
-                self._src_f0_ema_mean = chunk_f0_mean
-                self._src_f0_ema_std = chunk_f0_std
-            else:
-                self._src_f0_ema_mean = (
-                    EMA_MOMENTUM * self._src_f0_ema_mean + (1.0 - EMA_MOMENTUM) * chunk_f0_mean
-                )
-                self._src_f0_ema_std = (
-                    EMA_MOMENTUM * self._src_f0_ema_std  + (1.0 - EMA_MOMENTUM) * chunk_f0_std
-                )
-
-    # ── Stats accessors for inference ─────────────────────────────────────────
-
-    def _get_inference_stats(self) -> tuple:
-        """
-        Return (hubert_stats, f0_stats) for the current chunk's normalization,
-        or (None, None) if still in warmup.
-
-        During warmup, ContentEncoder uses F.instance_norm (training behaviour).
-        After warmup, EMA-derived stats give stable normalization for short chunks.
-        """
-        if self._stats_chunks < STATS_WARMUP:
-            return None, None
-
-        hub_mean_t = (
-            torch.from_numpy(self._hub_ema_mean)
-            .float().to(self.torch_device)
-            .view(1, 1, 768)   # [1, 1, 768] — broadcasts over [B, T, 768]
-        )
-        hub_std_t = (
-            torch.from_numpy(self._hub_ema_std)
-            .float().to(self.torch_device)
-            .view(1, 1, 768)
-        )
-        hubert_stats = (hub_mean_t, hub_std_t)
-
-        # Only enable F0 shifting once both source and target stats are available
-        # and crepe is installed.
-        f0_stats = None
+    def _get_f0_stats(self):
         if (
             self.model.content_encoder._crepe_available
             and self.tgt_f0_mean > 10.0
-            and self._src_f0_ema_mean > 10.0
+            and self._src_f0_mean > 10.0
         ):
-            f0_stats = (
-                self._src_f0_ema_mean,
-                max(self._src_f0_ema_std, 5.0),   # prevent near-zero std
-                self.tgt_f0_mean,
-                max(self.tgt_f0_std, 5.0),
+            # Ratio shift: f0_out = f0 * (tgt_mean / src_mean).
+            # Encoded into Z-score format so content_encoder.forward needs no changes:
+            #   (f0 - src_mean) / 1.0 * ratio + tgt_mean  =  f0 * ratio
+            ratio = self.tgt_f0_mean / self._src_f0_mean
+            return (self._src_f0_mean, 1.0, self.tgt_f0_mean, ratio)
+        return None
+
+    def _update_src_f0(self, audio_t: torch.Tensor) -> None:
+        """EMA update of source speaker F0 stats from this block."""
+        if not self.model.content_encoder._crepe_available:
+            return
+        with torch.no_grad():
+            f0_t = self.model.content_encoder._extract_f0(audio_t)
+        f0 = f0_t[0, :, 0].cpu().numpy()
+        voiced = f0 > 0.0
+        if voiced.sum() > 1:
+            cm = float(f0[voiced].mean())
+            cs = float(max(f0[voiced].std(), 5.0))
+            α = 0.05
+            if self._src_f0_mean == 0.0:
+                self._src_f0_mean, self._src_f0_std = cm, cs
+            else:
+                self._src_f0_mean = (1 - α) * self._src_f0_mean + α * cm
+                self._src_f0_std  = (1 - α) * self._src_f0_std  + α * cs
+
+    def _process_block(self, block: np.ndarray) -> np.ndarray:
+        """Process one BLOCK of audio through model.convert_chunk() — same as convert.py."""
+        t0 = time.time()
+
+        audio_t = torch.from_numpy(block).unsqueeze(0).to(self.dev)
+
+        self._update_src_f0(audio_t)
+        f0_stats = self._get_f0_stats()
+
+        # Run the exact same pipeline as convert.py
+        wav = self.model.convert_chunk(audio_t, self.C, f0_stats=f0_stats)
+        t_infer = time.time()
+
+        # Resample 24 kHz → 16 kHz
+        out = (
+            AF.resample(wav.squeeze(0), VOCODER_SR, SR)
+            .squeeze()
+            .cpu()
+            .numpy()
+            .astype(np.float32)
+        )
+        np.clip(out, -1.0, 1.0, out=out)
+
+        # CRITICAL: enforce output == BLOCK samples.
+        # Model produces slightly varying output lengths per block.
+        # If output > BLOCK, the excess accumulates in pacat's pipe and
+        # eventually blocks the write() call forever → "먹통".
+        raw_len = len(out)
+        if len(out) > BLOCK:
+            out = out[:BLOCK]
+        elif len(out) < BLOCK:
+            out = np.pad(out, (0, BLOCK - len(out)))
+
+        # Simple linear crossfade at boundary
+        n = min(SOLA_OVERLAP, len(out))
+        out[:n] = self._xfade_buf[:n] * self._fade_out[:n] + out[:n] * self._fade_in[:n]
+        self._xfade_buf = np.zeros(SOLA_OVERLAP, dtype=np.float32)
+        self._xfade_buf[:min(SOLA_OVERLAP, len(out))] = out[-min(SOLA_OVERLAP, len(out)):].copy()
+
+        self._n_chunks += 1
+        dt = time.time() - t0
+        budget = BLOCK / SR
+        if self._n_chunks <= 3 or self._n_chunks % 20 == 0:
+            print(
+                f"\n[TIMING] total={dt*1000:.0f}/{budget*1000:.0f}ms "
+                f"infer={1000*(t_infer-t0):.0f}ms "
+                f"f0={'ON' if f0_stats else 'OFF'} "
+                f"out={raw_len}/{BLOCK}"
             )
 
-        return hubert_stats, f0_stats
+        return out
 
-    # ── sounddevice callback (runs in PortAudio audio thread) ─────────────────
-
-    def _audio_callback(
-        self,
-        indata: np.ndarray,    # [CHUNK, 1]
-        outdata: np.ndarray,   # [CHUNK, 1]
-        frames: int,
-        time_info,
-        status,
-    ) -> None:
-        if status:
-            pass   # ignore overflow/underflow warnings in the hot path
-
-        # Push mic input
-        try:
-            self.mic_queue.put_nowait(indata[:, 0].copy())
-        except queue.Full:
-            pass   # drop under sustained backpressure
-
-        # Pull converted output
-        if self._ready.is_set() and self.out_deque:
-            chunk = self.out_deque.popleft()
-            n = min(len(chunk), frames)
-            outdata[:n, 0] = chunk[:n]
-            if n < frames:
-                outdata[n:, 0] = 0.0
-        else:
-            outdata[:, 0] = 0.0   # silence while pre-filling
-
-    # ── Processing thread (Python thread, runs inference on GPU) ──────────────
-
-    def _processing_thread(self) -> None:
+    def _infer_thread(self) -> None:
+        self.model.content_encoder.reset_dfn_state(batch_size=1)
         while not self._stop.is_set():
-            # Drain mic_queue into accumulation buffer
+            # Drop stale input if too far behind, but keep model state
+            if self.mic_q.qsize() > 20:
+                dropped = 0
+                while self.mic_q.qsize() > 5:
+                    try:
+                        self.mic_q.get_nowait()
+                        dropped += 1
+                    except queue.Empty:
+                        break
+                if dropped:
+                    self._accum = np.zeros(0, dtype=np.float32)
+
             try:
-                samples = self.mic_queue.get(timeout=0.05)
+                samples = self.mic_q.get(timeout=0.1)
             except queue.Empty:
                 continue
 
             self._accum = np.concatenate([self._accum, samples])
 
-            # Process whenever we have enough samples
-            while len(self._accum) >= PROC_SAMPLES:
-                chunk = self._accum[:PROC_SAMPLES]
-                self._accum = self._accum[PROC_SAMPLES:]
-
-                # ── Bug 2 fix: DFN GRU state isolation ──────────────────────
-                # DFN contains a stateful GRU.  Feeding the overlap prefix (raw
-                # audio that was already processed last iteration) would advance
-                # the GRU twice over the same timeline, destroying its temporal
-                # continuity and producing robotic noise.
-                # Solution: run DFN on the pure new chunk only, then prepend
-                # the *denoised* overlap for HuBERT edge quality.
-                chunk_t = (
-                    torch.from_numpy(chunk)
-                    .unsqueeze(0)
-                    .to(self.torch_device)
-                )                                             # [1, 2560]
-                with torch.no_grad():
-                    denoised_t = self.model.content_encoder._denoise(chunk_t)  # [1, 2560]
-                denoised_np = denoised_t.squeeze(0).cpu().numpy()
-
-                # Prepend stored denoised overlap for HuBERT left-context.
-                denoised_full = np.concatenate(
-                    [self._prev_denoised, denoised_np]
-                )                                             # 1280 + 2560 = 3840 samples
-                self._prev_denoised = denoised_np[-OVERLAP:].copy()
-
-                # ── Bug 1 fix: exact integer pipeline ────────────────────────
-                # Pass the full 3840 samples to HuBERT (overlap gives edge context),
-                # then trim OVERLAP_HUB_FRAMES=4 from the front of the content tensor
-                # inside convert_chunk_streaming so the decoder sees exactly 8 frames:
-                #   8 frames × 1.875 upsample = 15 mel frames  (exact, no floor loss)
-                #   15 × hop=256 = 3840 @ 24 kHz → ×(16/24) = 2560 @ 16 kHz = PROC_SAMPLES
-                audio_t = (
-                    torch.from_numpy(denoised_full)
-                    .unsqueeze(0)
-                    .to(self.torch_device)
-                )                                             # [1, 3840]
-
-                # ── Streaming normalisation stats update ─────────────────────
-                # extract_streaming_stats runs HuBERT and F0 once to get raw
-                # channel statistics for EMA tracking. These same models also run
-                # inside convert_chunk_streaming below. The small extra cost
-                # (~5 ms) is accepted to keep EMA logic outside the model.
-                hub_mean_t, hub_std_t, raw_f0_t = (
-                    self.model.content_encoder.extract_streaming_stats(audio_t)
-                )
-                self._update_stats_ema(hub_mean_t, hub_std_t, raw_f0_t)
-                self._stats_chunks += 1
-
-                # Use EMA stats from previous chunks for THIS chunk's normalization
-                # (None during warmup → falls back to per-chunk F.instance_norm).
-                hubert_stats, f0_stats = self._get_inference_stats()
-
-                wav = self.model.convert_chunk_streaming(
-                    audio_t, self.C,
-                    overlap_frames=OVERLAP_HUB_FRAMES,
-                    hubert_stats=hubert_stats,
-                    f0_stats=f0_stats,
-                )                                             # [1, 1, T_out @ 24000 Hz]
-
-                # Resample 24 kHz → 16 kHz.
-                # Ratio is exactly 2/3; 3840 × (2/3) = 2560 — no fractional samples.
-                wav_16k = AF.resample(wav.squeeze(0), VOCODER_SR, SR)  # [1, 2560]
-                out_np = wav_16k.squeeze().cpu().numpy().astype(np.float32)
-                np.clip(out_np, -1.0, 1.0, out=out_np)
-
-                # No ratio-trim needed: output is exactly PROC_SAMPLES (2560) long.
-
-                # Split into CHUNK-sized slices and push to jitter buffer
-                for i in range(0, len(out_np), CHUNK):
-                    self.out_deque.append(out_np[i: i + CHUNK])
-
-                self._pre_fill_count += 1
-                if self._pre_fill_count >= JITTER_TARGET and not self._ready.is_set():
+            while len(self._accum) >= BLOCK:
+                out = self._process_block(self._accum[:BLOCK])
+                self._accum = self._accum[BLOCK:]
+                for i in range(0, len(out), CHUNK):
+                    piece = out[i : i + CHUNK]
+                    if len(piece) > 0:
+                        try:
+                            self.out_q.put_nowait(piece)
+                        except queue.Full:
+                            pass  # drop excess rather than blocking
+                if not self._ready.is_set():
                     self._ready.set()
-                    print("[CONVERT] Buffer ready — playback started.")
+                    print("[CONVERT] Playback started.")
 
-    # ── Public interface ──────────────────────────────────────────────────────
+    # ── sounddevice run ────────────────────────────────────────────────────────
 
-    def run(self) -> None:
-        """Start real-time conversion. Blocks until Ctrl+C."""
-        # Reset DFN GRU state for this session
-        self.model.content_encoder.reset_dfn_state(batch_size=1)
+    def _sd_callback(self, indata, outdata, frames, time_info, status) -> None:
+        try:
+            self.mic_q.put_nowait(indata[:, 0].copy())
+        except queue.Full:
+            pass
+        if self._ready.is_set() and not self.out_q.empty():
+            chunk = self.out_q.get_nowait()
+            n = min(len(chunk), frames)
+            outdata[:n, 0] = chunk[:n]
+            if n < frames:
+                outdata[n:, 0] = 0.0
+        else:
+            outdata[:, 0] = 0.0
 
-        proc = threading.Thread(
-            target=self._processing_thread, daemon=True, name="inference"
-        )
-        proc.start()
-
-        print(f"\n[CONVERT] Streaming started (chunk={CHUNK}, proc={PROC_SAMPLES}).")
+    def run(self, device_in=None, device_out=None) -> None:
+        """Run with sounddevice. Blocks until Ctrl+C."""
+        infer = threading.Thread(target=self._infer_thread, daemon=True, name="infer")
+        infer.start()
+        print(f"\n[CONVERT] Streaming (BLOCK={BLOCK} = {BLOCK/SR*1000:.0f}ms).")
         print("[CONVERT] Speak into the microphone. Press Ctrl+C to stop.\n")
-
         try:
             with sd.Stream(
                 samplerate=SR,
                 channels=1,
                 dtype="float32",
                 blocksize=CHUNK,
-                device=(self.device_in, self.device_out),
-                callback=self._audio_callback,
+                device=(device_in, device_out),
+                callback=self._sd_callback,
             ):
                 while not self._stop.is_set():
                     time.sleep(0.2)
-                    # Print live buffer depth every 2 seconds
                     if int(time.time()) % 2 == 0:
                         print(
-                            f"\r[CONVERT] buffer depth: {len(self.out_deque):2d} chunks  ",
+                            f"\r[CONVERT] buf={self.out_q.qsize():2d}  ",
                             end="",
                             flush=True,
                         )
@@ -459,87 +376,288 @@ class RealtimeConverter:
             print("\n[CONVERT] Stopping …")
         finally:
             self._stop.set()
-            proc.join(timeout=2.0)
+            infer.join(timeout=2.0)
+            print("[CONVERT] Done.")
+
+    # ── PulseAudio run ─────────────────────────────────────────────────────────
+
+    def run_pa(
+        self, device_in: str | None = None, device_out: str | None = None
+    ) -> None:
+        """Run with PulseAudio (parec/pacat). Blocks until Ctrl+C.
+
+        Architecture (3 threads):
+          reader  → mic_q → infer → out_q → writer → pacat
+          
+        Critical: infer thread NEVER blocks on I/O. If writer can't
+        keep up (WSL2 audio bridge stall), infer drops output rather
+        than stalling. This prevents mic_q from growing.
+        """
+        # Output queue: small buffer between infer and writer.
+        # NOT the same as self.out_q (used by sounddevice path).
+        pa_out_q: queue.Queue[np.ndarray] = queue.Queue(maxsize=10)
+
+        in_cmd = [
+            "parec",
+            "--channels=1",
+            f"--rate={SR}",
+            "--format=float32le",
+            "--latency-msec=60",
+        ]
+        out_cmd = [
+            "pacat",
+            "--channels=1",
+            f"--rate={SR}",
+            "--format=float32le",
+            "--latency-msec=60",
+        ]
+        if device_in:
+            in_cmd += ["--device", device_in]
+        if device_out:
+            out_cmd += ["--device", device_out]
+
+        parec = subprocess.Popen(in_cmd, stdout=subprocess.PIPE)
+        pacat_ref = [subprocess.Popen(out_cmd, stdin=subprocess.PIPE, bufsize=0)]
+
+        def _reader() -> None:
+            n_bytes = CHUNK * 4
+            while not self._stop.is_set():
+                data = parec.stdout.read(n_bytes)
+                if not data:
+                    break
+                try:
+                    self.mic_q.put_nowait(np.frombuffer(data, dtype=np.float32).copy())
+                except queue.Full:
+                    pass
+
+        def _infer() -> None:
+            """Process mic → model. NEVER blocks on I/O."""
+            self.model.content_encoder.reset_dfn_state(batch_size=1)
+            accum = np.zeros(0, dtype=np.float32)
+            blk = 0
+
+            while not self._stop.is_set():
+                try:
+                    samples = self.mic_q.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+
+                accum = np.concatenate([accum, samples])
+
+                while len(accum) >= BLOCK:
+                    out = self._process_block(accum[:BLOCK])
+                    accum = accum[BLOCK:]
+                    blk += 1
+
+                    # Put output into writer queue. If full, drop (never block).
+                    try:
+                        pa_out_q.put_nowait(out.astype(np.float32).tobytes())
+                    except queue.Full:
+                        # Drop oldest, put newest
+                        try:
+                            pa_out_q.get_nowait()
+                        except queue.Empty:
+                            pass
+                        try:
+                            pa_out_q.put_nowait(out.astype(np.float32).tobytes())
+                        except queue.Full:
+                            pass
+
+        write_count = [0]  # mutable counter for writer thread
+        write_blocked = [False]
+
+        def _writer() -> None:
+            """Write audio to pacat with non-blocking I/O; full process restart on stall."""
+            def _make_nonblocking(p):
+                fd = p.stdin.fileno()
+                fcntl.fcntl(fd, fcntl.F_SETFL,
+                            fcntl.fcntl(fd, fcntl.F_GETFL) | os.O_NONBLOCK)
+                return fd
+
+            def _flush_pa_q():
+                while True:
+                    try:
+                        pa_out_q.get_nowait()
+                    except queue.Empty:
+                        break
+
+            def _hard_restart():
+                print("\n[WRITER] Audio broken — restarting process …")
+                parec.terminate()
+                pacat_ref[0].terminate()
+                os.execv(sys.executable, [sys.executable] + sys.argv)
+
+            fd = _make_nonblocking(pacat_ref[0])
+            stall_since = None
+
+            while not self._stop.is_set():
+                try:
+                    data = pa_out_q.get(timeout=0.2)
+                except queue.Empty:
+                    continue
+                write_blocked[0] = True
+                try:
+                    fd = pacat_ref[0].stdin.fileno()
+                    written = os.write(fd, data)
+                    if written == len(data):
+                        write_count[0] += 1
+                        stall_since = None
+                    else:
+                        if stall_since is None:
+                            stall_since = time.time()
+                        elif time.time() - stall_since > 2.0:
+                            _hard_restart()
+                        else:
+                            _flush_pa_q()
+                except BlockingIOError:
+                    if stall_since is None:
+                        stall_since = time.time()
+                    elif time.time() - stall_since > 2.0:
+                        _hard_restart()
+                    else:
+                        _flush_pa_q()
+                except OSError:
+                    _hard_restart()
+                finally:
+                    write_blocked[0] = False
+
+        rt = threading.Thread(target=_reader, daemon=True, name="pa-in")
+        it = threading.Thread(target=_infer, daemon=True, name="infer")
+        wt = threading.Thread(target=_writer, daemon=True, name="pa-out")
+        rt.start()
+        it.start()
+        wt.start()
+
+        print(
+            f"\n[CONVERT] Streaming via PulseAudio (BLOCK={BLOCK} = {BLOCK/SR*1000:.0f}ms)."
+        )
+        print("[CONVERT] Speak into the microphone. Press Ctrl+C to stop.\n")
+        try:
+            last_wc = 0
+            while not self._stop.is_set():
+                time.sleep(2.0)
+                wc = write_count[0]
+                print(
+                    f"\r[STATUS] mic_q={self.mic_q.qsize():2d} "
+                    f"out_q={pa_out_q.qsize():2d} "
+                    f"writes={wc} (+{wc-last_wc}) "
+                    f"blocked={write_blocked[0]} "
+                    f"threads: r={rt.is_alive()} i={it.is_alive()} w={wt.is_alive()}  ",
+                    end="", flush=True,
+                )
+                last_wc = wc
+        except KeyboardInterrupt:
+            print("\n[CONVERT] Stopping …")
+        finally:
+            self._stop.set()
+            parec.terminate()
+            pacat_ref[0].terminate()
+            it.join(timeout=2.0)
+            rt.join(timeout=1.0)
+            wt.join(timeout=1.0)
             print("[CONVERT] Done.")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
+
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Real-time microphone voice conversion (no server)"
+        description="Real-time microphone voice conversion"
     )
     parser.add_argument(
-        "--checkpoint", default="checkpoints/best.pt",
-        help="Trained model checkpoint (default: checkpoints/best.pt)",
+        "--checkpoint", default="checkpoints/best.pt", help="Model checkpoint path"
     )
     parser.add_argument(
-        "--reference", default=None,
-        help="WAV file of target speaker (skip mic recording if provided)",
+        "--reference",
+        default=None,
+        help="WAV file of target speaker (skips mic recording)",
     )
     parser.add_argument(
-        "--record-seconds", type=int, default=5,
-        help="Seconds to record target speaker from mic (default: 5)",
+        "--record-seconds",
+        type=int,
+        default=5,
+        help="Seconds to record target speaker (default: 5)",
     )
     parser.add_argument(
-        "--device-in", type=int, default=None,
-        help="Input audio device index (default: system default)",
+        "--device-in",
+        default=None,
+        help="Input device: int index (sounddevice) or name (--pa)",
     )
     parser.add_argument(
-        "--device-out", type=int, default=None,
-        help="Output audio device index (default: system default)",
+        "--device-out",
+        default=None,
+        help="Output device: int index (sounddevice) or name (--pa)",
     )
     parser.add_argument(
-        "--list-devices", action="store_true",
-        help="Print available audio devices and exit",
+        "--list-devices", action="store_true", help="Print audio devices and exit"
+    )
+    parser.add_argument(
+        "--pa",
+        action="store_true",
+        help="Use PulseAudio backend (parec/pacat) — for WSL2/WSLg",
     )
     args = parser.parse_args()
 
     if args.list_devices:
-        list_devices()
+        list_devices(use_pa=args.pa)
         return
 
-    # ── Load model ────────────────────────────────────────────────────────────
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[INIT] Device: {device}")
-
     print("[INIT] Loading model …")
     model = VoiceConversionModel(device=device)
 
     ckpt_path = Path(args.checkpoint)
     if ckpt_path.exists():
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-        state = ckpt["model"] if "model" in ckpt else ckpt
+        state = ckpt.get("model", ckpt)
         model.load_state_dict(state, strict=False)
         print(f"[INIT] Checkpoint loaded: {ckpt_path}")
     else:
-        print(f"[INIT] WARNING: checkpoint not found ({ckpt_path}), using random weights")
+        print(
+            f"[INIT] WARNING: checkpoint not found ({ckpt_path}), using random weights"
+        )
     model.eval()
 
-    # ── Compute context vector C ──────────────────────────────────────────────
     if args.reference:
-        # Load from file
         print(f"[REF] Loading reference: {args.reference}")
-        ref_audio = load_wav_reference(args.reference, device)  # [1, T]
+        ref_audio = load_wav_reference(args.reference, device)
     else:
-        # Record from microphone
-        ref_np = record_reference(args.record_seconds, device_in=args.device_in)
-        ref_audio = torch.from_numpy(ref_np).unsqueeze(0).to(device)  # [1, T]
+        if args.pa:
+            ref_np = record_reference_pa(args.record_seconds, device_in=args.device_in)
+        else:
+            if not _SD_AVAILABLE:
+                print(
+                    "[ERROR] sounddevice not available. Use --pa or --reference <wav>."
+                )
+                sys.exit(1)
+            ref_np = record_reference(
+                args.record_seconds,
+                device_in=int(args.device_in) if args.device_in is not None else None,
+            )
+        ref_audio = torch.from_numpy(ref_np).unsqueeze(0).to(device)
+        # Save recording so that auto-restart skips the mic recording step.
+        _ref_tmp = "/tmp/mic_convert_ref.wav"
+        sf.write(_ref_tmp, ref_np, SR)
+        sys.argv = [sys.argv[0], "--reference", _ref_tmp] + sys.argv[1:]
 
-    ref_mel = audio_to_mel(ref_audio, device)          # [1, N_MELS, T_mel]
-    C = model.compute_context([ref_mel])               # [1, 256]
+    ref_mel = audio_to_mel(ref_audio, device)
+    C = model.compute_context([ref_mel])
     print(f"[REF] Context vector ready: {C.shape}, norm={C.norm().item():.3f}")
 
-    # ── Start real-time conversion ────────────────────────────────────────────
-    converter = RealtimeConverter(
-        model=model,
-        C=C,
-        device=device,
-        ref_audio=ref_audio,
-        device_in=args.device_in,
-        device_out=args.device_out,
-    )
-    converter.run()
+    converter = RealtimeConverter(model=model, C=C, device=device, ref_audio=ref_audio)
+
+    if args.pa:
+        converter.run_pa(device_in=args.device_in, device_out=args.device_out)
+    else:
+        if not _SD_AVAILABLE:
+            print("[ERROR] sounddevice not available. Use --pa.")
+            sys.exit(1)
+        converter.run(
+            device_in=int(args.device_in) if args.device_in is not None else None,
+            device_out=int(args.device_out) if args.device_out is not None else None,
+        )
 
 
 if __name__ == "__main__":

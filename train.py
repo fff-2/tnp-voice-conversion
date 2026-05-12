@@ -56,8 +56,8 @@ N_MELS = 100
 # beta=1e-6 for the first KL_ANNEAL_START steps (pure reconstruction warmup),
 # then linearly ramps to KL_BETA_MAX by KL_ANNEAL_END.  Prevents posterior collapse.
 KL_ANNEAL_START = 5_000
-KL_ANNEAL_END = 30_000
-KL_BETA_MAX = 0.01
+KL_ANNEAL_END = 20_000
+KL_BETA_MAX = 0.0008
 
 
 # ── LR schedule: linear warmup → cosine decay ────────────────────────────────
@@ -72,11 +72,12 @@ def get_lr(step: int, warmup: int, max_steps: int, base_lr: float) -> float:
 
 def get_beta(step: int) -> float:
     """Linear KL annealing: 0 → KL_BETA_MAX over [KL_ANNEAL_START, KL_ANNEAL_END]."""
-    if step < KL_ANNEAL_START:
-        return 1e-6
-    if step >= KL_ANNEAL_END:
-        return KL_BETA_MAX
-    return KL_BETA_MAX * (step - KL_ANNEAL_START) / (KL_ANNEAL_END - KL_ANNEAL_START)
+    # if step < KL_ANNEAL_START:
+    #     return 1e-6
+    # if step >= KL_ANNEAL_END:
+    #     return KL_BETA_MAX
+    # return KL_BETA_MAX * (step - KL_ANNEAL_START) / (KL_ANNEAL_END - KL_ANNEAL_START)
+    return 0.0004
 
 
 # ── Training loop ─────────────────────────────────────────────────────────────

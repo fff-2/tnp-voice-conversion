@@ -162,7 +162,8 @@ class VoiceConversionModel(nn.Module):
         self,
         predenoised_audio: Tensor,
         C: Tensor,
-        overlap_frames: int = 0,
+        skip_head: int = 0,
+        return_length: int | None = None,
         ctx_mask: Tensor | None = None,
         hubert_stats: tuple | None = None,
         f0_stats: tuple | None = None,
@@ -170,44 +171,123 @@ class VoiceConversionModel(nn.Module):
         """
         Streaming variant of convert_chunk for real-time mic conversion.
 
-        The caller must run content_encoder._denoise() on the raw non-overlapping
-        chunk *before* calling this method, then prepend the stored denoised
-        overlap prefix. This ensures the DFN GRU only advances over new audio and
-        never re-processes past samples.
+        The caller feeds a ring buffer of recent denoised audio (~1.5 s) so that
+        HuBERT sees enough temporal context.  Only the content frames from
+        ``skip_head`` to ``skip_head + return_length`` are forwarded through the
+        decoder and vocoder, producing audio for exactly the newest block.
 
-        overlap_frames content frames are discarded from the front of the HuBERT
-        output so the decoder receives only the new-chunk frames, keeping the
-        output length deterministic and aligned with PROC_SAMPLES:
-
-            PROC_SAMPLES=2560 / HOP=320 = 8 HuBERT frames
-            8 frames × 1.875 upsample = 15 Vocos mel frames  (exact integer)
-            15 × hop_length=256 = 3840 samples @ 24 kHz
-            3840 × (16000/24000) = 2560 samples @ 16 kHz  ← equals PROC_SAMPLES
+        This follows the RVC pattern:
+            input_wav = [context_history | new_block]
+            HuBERT features = extract from full input_wav
+            keep only features[skip_head : skip_head + return_length]
+            → decoder → vocoder → output audio for new_block only
 
         Args:
-            predenoised_audio: [1, T]  denoised audio with overlap prefix prepended
+            predenoised_audio: [1, T]  denoised audio ring buffer at 16 kHz
             C:                 [1, T_ctx, D_MODEL]  pre-cached speaker context
-            overlap_frames:    HuBERT frames at the front of content to discard
+            skip_head:         number of content frames to discard from front
+            return_length:     number of content frames to keep (None = all after skip_head)
             ctx_mask:          optional padding mask for C
             hubert_stats:      (mean, std) each [1, 1, 768] — EMA stats for stable
-                               streaming normalization; replaces per-chunk instance_norm
+                               streaming normalization
             f0_stats:          (src_mean, src_std, tgt_mean, tgt_std) floats — shifts
                                voiced F0 from source to target speaker range
         Returns:
             waveform: [1, 1, T_out]  24000 Hz float32
         """
         self.eval()
-        # skip_denoise=True: caller ran DFN on the clean chunk only (GRU state isolation)
+        # skip_denoise=True: caller manages DFN GRU state separately
         content = self.content_encoder(
             predenoised_audio,
             skip_denoise=True,
             hubert_stats=hubert_stats,
             f0_stats=f0_stats,
         )
-        if overlap_frames > 0:
-            content = content[:, overlap_frames:, :]
+        # Trim to only the new-block frames (RVC skip_head / return_length)
+        if return_length is not None:
+            content = content[:, skip_head : skip_head + return_length, :]
+        elif skip_head > 0:
+            content = content[:, skip_head:, :]
         fused = self.cross_attention(content, C, key_padding_mask=ctx_mask)
         mel = self.decoder(fused)
+        wav = self.vocoder(mel.transpose(1, 2))
+        return wav
+
+    @torch.no_grad()
+    def convert_from_features(
+        self,
+        hubert_feat: Tensor,
+        f0: Tensor,
+        C: Tensor,
+        skip_head: int = 0,
+        return_length: int | None = None,
+        ctx_mask: Tensor | None = None,
+        hubert_stats: tuple | None = None,
+        f0_stats: tuple | None = None,
+    ) -> Tensor:
+        """
+        Convert using pre-extracted HuBERT and F0 features (zero-redundancy path).
+
+        The caller has already run _extract_hubert and _extract_f0 (e.g. for EMA
+        stats update).  This method applies normalisation, F0 shifting, frame
+        trimming, cross-attention, decoder, and vocoder — without re-running the
+        heavy feature extractors.
+
+        Args:
+            hubert_feat:   [1, T_frames, 768]  raw HuBERT features (unnormalised)
+            f0:            [1, T_frames, 1]    raw F0 in Hz (0.0 for unvoiced)
+            C:             [1, T_ctx, D_MODEL]  pre-cached speaker context
+            skip_head:     content frames to discard from front
+            return_length: content frames to keep (None = all after skip_head)
+            ctx_mask:      optional padding mask for C
+            hubert_stats:  (mean, std) each [1, 1, 768] — EMA stats
+            f0_stats:      (src_mean, src_std, tgt_mean, tgt_std) floats
+        Returns:
+            waveform: [1, 1, T_out]  24000 Hz float32
+        """
+        import torch.nn.functional as F
+
+        self.eval()
+
+        # Align lengths (HuBERT and crepe may differ by 1 frame)
+        T = min(hubert_feat.shape[1], f0.shape[1])
+        hubert_feat = hubert_feat[:, :T, :]
+        f0 = f0[:, :T, :]
+
+        # Normalise HuBERT
+        if hubert_stats is not None:
+            hub_mean, hub_std = hubert_stats
+            hubert_norm = (hubert_feat - hub_mean) / (hub_std + 1e-5)
+        else:
+            hubert_norm = F.instance_norm(
+                hubert_feat.transpose(1, 2)
+            ).transpose(1, 2)
+
+        # F0 shifting
+        if f0_stats is not None:
+            src_mean, src_std, tgt_mean, tgt_std = f0_stats
+            voiced_mask = (f0 > 0.0).float()
+            f0_shifted = (f0 - src_mean) / (src_std + 1e-5) * tgt_std + tgt_mean
+            f0 = voiced_mask * f0_shifted.clamp(min=50.0) + (1.0 - voiced_mask) * f0
+
+        f0 = torch.log1p(f0)
+        content = torch.cat([hubert_norm, f0], dim=-1)  # [1, T_all, 769]
+
+        # Pass ALL frames through cross-attention and decoder so the decoder's
+        # self-attention sees full temporal context (critical for quality).
+        fused = self.cross_attention(content, C, key_padding_mask=ctx_mask)
+        mel = self.decoder(fused)  # [1, T_mel_all, n_mels]
+
+        # Trim mel to only the new-block portion before vocoder.
+        # mel has ~1.875× more frames than content (decoder upsampling).
+        if return_length is not None:
+            T_content = content.shape[1]
+            T_mel = mel.shape[1]
+            scale = T_mel / T_content
+            mel_start = int(round(skip_head * scale))
+            mel_end = int(round((skip_head + return_length) * scale))
+            mel = mel[:, mel_start:mel_end, :]
+
         wav = self.vocoder(mel.transpose(1, 2))
         return wav
 

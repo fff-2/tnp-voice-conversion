@@ -255,7 +255,6 @@ class ContentEncoder(nn.Module):
             src_mean, src_std, tgt_mean, tgt_std = f0_stats
             voiced_mask = (f0 > 0.0).float()
             f0_shifted = (f0 - src_mean) / (src_std + 1e-5) * tgt_std + tgt_mean
-            # clamp_min=0 prevents negative pitch; unvoiced frames keep original 0.0
             f0 = voiced_mask * f0_shifted.clamp(min=50.0) + (1.0 - voiced_mask) * f0
 
         f0 = torch.log1p(f0)  # [0, 2006] Hz → [0, ~7.6]

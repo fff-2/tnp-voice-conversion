@@ -179,6 +179,10 @@ def train(args) -> None:
             if step >= MAX_STEPS:
                 break
 
+            # ── Bug fix: Reset DFN state for each batch ───────────────────────
+            # Prevent GRU from carrying over state between unrelated random samples
+            model.content_encoder.reset_dfn_state(batch_size=BATCH_SIZE)
+
             source_audio = batch["source_audio"].to(device)  # [B, T] augmented
             content_audio = batch["audio_content"].to(device)  # [B, T] clean target
             ctx_mels = batch["context_mels"].to(device)  # [B, N_CTX, N_MELS, T_ctx]
@@ -244,14 +248,24 @@ def train(args) -> None:
                 with torch.no_grad():
                     content = model.content_encoder(
                         source_audio,
-                        f0_audio_16k=content_audio
+                        f0_audio_16k=content_audio,
+                        lengths=content_lengths
                     )  # [B, T_frames, 769]
 
                 # ── Cross-attention + decode ──────────────────────────────────
                 fused = model.cross_attention(
                     content, C, key_padding_mask=ctx_mask
                 )  # [B, T_frames, d_model]
-                pred_mel = model.decoder(fused)  # [B, T_mel_pred, N_MELS]
+                
+                # Content padding mask for the decoder self-attention
+                T_frames = fused.shape[1]
+                content_mask = torch.zeros(B, T_frames, dtype=torch.bool, device=device)
+                for i, L in enumerate(content_lengths):
+                    flen = (L // 320) + 1
+                    if flen < T_frames:
+                        content_mask[i, flen:] = True
+                        
+                pred_mel = model.decoder(fused, key_padding_mask=content_mask)  # [B, T_mel_pred, N_MELS]
 
                 # ── Target mel (always from unperturbed content_audio) ────────
                 with torch.no_grad():
@@ -364,6 +378,10 @@ def _validate(
     for batch in loader:
         source = batch["source_audio"].to(device)
         content_audio = batch["audio_content"].to(device)
+        
+        B_val = source.shape[0]
+        model.content_encoder.reset_dfn_state(batch_size=B_val)
+
         ctx_mels = batch["context_mels"].to(device)
 
         source_lengths = batch["source_lengths"]
@@ -393,9 +411,17 @@ def _validate(
                     valid = ctx_mel_lens[i][n]
                     ctx_mask[i, n * T_ctx_enc : n * T_ctx_enc + valid] = False
 
-            content = model.content_encoder(content_audio)
+            content = model.content_encoder(content_audio, lengths=content_lengths)
             fused = model.cross_attention(content, C, key_padding_mask=ctx_mask)
-            pred_mel = model.decoder(fused)
+            
+            T_frames = fused.shape[1]
+            content_mask = torch.zeros(B, T_frames, dtype=torch.bool, device=device)
+            for i, L in enumerate(content_lengths):
+                flen = (L // 320) + 1
+                if flen < T_frames:
+                    content_mask[i, flen:] = True
+                    
+            pred_mel = model.decoder(fused, key_padding_mask=content_mask)
             tgt_mel = mel_transform(mel_resampler(content_audio)).transpose(1, 2)
             tgt_mel = torch.log(tgt_mel.clamp(min=1e-7))
             T = min(pred_mel.shape[1], tgt_mel.shape[1])

@@ -155,6 +155,7 @@ class ContentEncoder(nn.Module):
         hubert_stats: tuple | None = None,
         f0_stats: tuple | None = None,
         f0_audio_16k: Tensor | None = None,
+        lengths: list[int] | None = None,
     ) -> Tensor:
         """
         Full content encoding pipeline.
@@ -184,6 +185,8 @@ class ContentEncoder(nn.Module):
 
         # Step 3: F0
         if f0_audio_16k is not None:
+            if not skip_denoise:
+                self.reset_dfn_state(batch_size=f0_audio_16k.shape[0])
             f0_audio = f0_audio_16k if skip_denoise else self._denoise(f0_audio_16k)
             f0 = self._extract_f0(f0_audio)
         else:
@@ -202,6 +205,25 @@ class ContentEncoder(nn.Module):
         if hubert_stats is not None:
             hub_mean, hub_std = hubert_stats   # [1, 1, 768] each, broadcast over [B, T, 768]
             hubert_norm = (hubert_feat - hub_mean) / (hub_std + 1e-5)
+        elif lengths is not None:
+            # Masked instance normalization (prevents zero-padding from contaminating stats)
+            B, T_frames, C_dim = hubert_feat.shape
+            # Calculate valid frame lengths (matches torchaudio hubert stride 320)
+            frame_lengths = [(L // self.HOP) + 1 for L in lengths]
+            
+            mask = torch.zeros(B, T_frames, device=hubert_feat.device, dtype=torch.bool)
+            for i, flen in enumerate(frame_lengths):
+                mask[i, :min(flen, T_frames)] = True
+                
+            hub_masked = hubert_feat * mask.unsqueeze(-1)
+            count = mask.sum(dim=1, keepdim=True).unsqueeze(-1).clamp(min=1)  # [B, 1, 1]
+            
+            hub_mean = hub_masked.sum(dim=1, keepdim=True) / count            # [B, 1, 768]
+            hub_var = (((hubert_feat - hub_mean) ** 2) * mask.unsqueeze(-1)).sum(dim=1, keepdim=True) / count
+            hub_std = torch.sqrt(hub_var + 1e-5)                              # [B, 1, 768]
+            
+            hubert_norm = (hubert_feat - hub_mean) / hub_std
+            hubert_norm = hubert_norm * mask.unsqueeze(-1)  # Re-zero the padding area
         else:
             hubert_norm = F.instance_norm(
                 hubert_feat.transpose(1, 2)    # [B, 768, T]

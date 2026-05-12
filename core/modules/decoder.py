@@ -63,10 +63,11 @@ class MelDecoder(nn.Module):
         self.upsample = nn.Upsample(scale_factor=24000 / (256 * 50), mode="linear", align_corners=False)
         self.out_proj = nn.Linear(d_model, n_mels)
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: Tensor, key_padding_mask: Tensor | None = None) -> Tensor:
         """
         Args:
             x:   [B, T_frames, d_model]
+            key_padding_mask: [B, T_frames] bool, True = padding
         Returns:
             mel: [B, T_mel, n_mels]
         """
@@ -74,7 +75,7 @@ class MelDecoder(nn.Module):
             x = block(x)                               # [B, T_frames, d_model]
 
         for layer in self.transformer_layers:
-            x = layer(x)                               # [B, T_frames, d_model]
+            x = layer(x, src_key_padding_mask=key_padding_mask) # [B, T_frames, d_model]
 
         x = self.out_norm(x)                           # [B, T_frames, d_model]
 

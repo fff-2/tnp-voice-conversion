@@ -27,7 +27,9 @@ import torchaudio
 from torch.utils.data import Dataset
 
 SAMPLE_RATE = 16_000
-MEL_SAMPLE_RATE = 24_000   # resample to this before computing mel (matches vocos-mel-24khz)
+MEL_SAMPLE_RATE = (
+    24_000  # resample to this before computing mel (matches vocos-mel-24khz)
+)
 N_MELS = 100
 AUDIO_EXTENSIONS = {".wav", ".flac", ".mp3", ".ogg"}
 
@@ -85,40 +87,47 @@ class SpeakerDataset(Dataset):
         if split == "train":
             chosen = spk_list[:cut]
         else:
-            chosen = spk_list[cut:] or spk_list[-1:]   # at least 1 val speaker
+            chosen = spk_list[cut:] or spk_list[-1:]  # at least 1 val speaker
 
         self.speakers: dict[str, list[Path]] = {s: speakers[s] for s in chosen}
         self.spk_names = list(self.speakers.keys())
 
         # Build index: each entry is (spk, utt_idx).
         # source = augmented version of utt_idx; audio_content = clean version.
-        N_ITEMS = 200  # items per speaker
+        N_ITEMS = 350  # items per speaker (cap); speakers with fewer files use all without duplication
         self.pairs: list[tuple[str, int]] = []
         rng2 = random.Random(seed + 1)
         for spk in self.spk_names:
             files = self.speakers[spk]
-            for _ in range(N_ITEMS):
-                self.pairs.append((spk, rng2.randrange(len(files))))
+            n = len(files)
+            if n >= N_ITEMS:
+                indices = rng2.sample(range(n), N_ITEMS)
+            else:
+                indices = list(range(n))
+            for idx in indices:
+                self.pairs.append((spk, idx))
 
         rng2.shuffle(self.pairs)
 
-        print(f"SpeakerDataset [{split}]: {len(self.spk_names)} speakers, "
-              f"{len(self.pairs)} items")
+        print(
+            f"SpeakerDataset [{split}]: {len(self.spk_names)} speakers, "
+            f"{len(self.pairs)} items"
+        )
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
     def _load(self, path: Path) -> torch.Tensor:
         """Load audio file → mono float32 tensor [T] @ 16 kHz, trimmed to max_samples."""
         data, sr = sf.read(str(path), dtype="float32", always_2d=True)
-        wav = torch.from_numpy(data.T)                    # [C, T]
+        wav = torch.from_numpy(data.T)  # [C, T]
         if wav.shape[0] > 1:
-            wav = wav.mean(0, keepdim=True)               # [1, T]
+            wav = wav.mean(0, keepdim=True)  # [1, T]
         if sr != SAMPLE_RATE:
             wav = torchaudio.functional.resample(wav, sr, SAMPLE_RATE)
-        wav = wav.squeeze(0)                              # [T]
+        wav = wav.squeeze(0)  # [T]
         if wav.shape[0] > self.max_samples:
             start = random.randint(0, wav.shape[0] - self.max_samples)
-            wav = wav[start: start + self.max_samples]
+            wav = wav[start : start + self.max_samples]
         return wav
 
     def _load_aug(self, path: Path) -> torch.Tensor | None:
@@ -132,11 +141,19 @@ class SpeakerDataset(Dataset):
     @staticmethod
     def _mel(audio: torch.Tensor) -> torch.Tensor:
         """[T] → [N_MELS, T_mel] log-compressed mel at 24000 Hz (on CPU)."""
-        audio_24k = torchaudio.functional.resample(audio.unsqueeze(0), SAMPLE_RATE, MEL_SAMPLE_RATE).squeeze(0)
+        audio_24k = torchaudio.functional.resample(
+            audio.unsqueeze(0), SAMPLE_RATE, MEL_SAMPLE_RATE
+        ).squeeze(0)
         transform = torchaudio.transforms.MelSpectrogram(
-            sample_rate=MEL_SAMPLE_RATE, n_fft=1024, hop_length=256, win_length=1024, n_mels=N_MELS, power=1.0, center=True,
+            sample_rate=MEL_SAMPLE_RATE,
+            n_fft=1024,
+            hop_length=256,
+            win_length=1024,
+            n_mels=N_MELS,
+            power=1.0,
+            center=True,
         )
-        mel = transform(audio_24k.unsqueeze(0)).squeeze(0)   # [N_MELS, T_mel]
+        mel = transform(audio_24k.unsqueeze(0)).squeeze(0)  # [N_MELS, T_mel]
         return torch.log(mel.clamp(min=1e-7))
 
     # ── Dataset interface ─────────────────────────────────────────────────────
@@ -159,14 +176,14 @@ class SpeakerDataset(Dataset):
         wav = wav.squeeze(0)  # [T] @ 16 kHz
 
         start = random.randint(0, max(0, wav.shape[0] - self.max_samples))
-        audio_content = wav[start: start + self.max_samples]
+        audio_content = wav[start : start + self.max_samples]
 
         # Apply the same start to the augmented tensor so source and content
         # cover the same portion of the utterance.
         aug_wav = self._load_aug(path)
         if aug_wav is not None:
             aug_start = min(start, max(0, aug_wav.shape[0] - self.max_samples))
-            source_audio = aug_wav[aug_start: aug_start + self.max_samples]
+            source_audio = aug_wav[aug_start : aug_start + self.max_samples]
         else:
             source_audio = audio_content  # fallback: clean
 
@@ -174,7 +191,7 @@ class SpeakerDataset(Dataset):
         ctx_indices = [i for i in range(len(spk_files)) if i != utt_idx]
         ctx_indices = random.sample(ctx_indices, min(self.n_ctx, len(ctx_indices)))
         max_mel_frames = int(self.max_samples * (MEL_SAMPLE_RATE / SAMPLE_RATE) / 256)
-        
+
         mels = []
         mel_lens = []
         for i in ctx_indices:
@@ -189,15 +206,15 @@ class SpeakerDataset(Dataset):
             mel_lens.append(mel.shape[-1])  # unpadded T for this mel
             mels.append(mel)
         max_T = max(m.shape[-1] for m in mels)
-        context_mels = torch.stack([
-            F.pad(m, (0, max_T - m.shape[-1])) for m in mels
-        ])   # [N_CTX, N_MELS, T_ctx]
+        context_mels = torch.stack(
+            [F.pad(m, (0, max_T - m.shape[-1])) for m in mels]
+        )  # [N_CTX, N_MELS, T_ctx]
 
         return {
             "source_audio": source_audio,
             "audio_content": audio_content,
             "context_mels": context_mels,
-            "ctx_mel_lens": mel_lens,   # list[N_CTX] of ints: unpadded T per ref mel
+            "ctx_mel_lens": mel_lens,  # list[N_CTX] of ints: unpadded T per ref mel
         }
 
 

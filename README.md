@@ -1,6 +1,6 @@
 # Real-Time Voice Conversion Pipeline — Deterministic TNP-D
 
-Few-shot, real-time voice conversion. Record a few seconds of a target speaker — the system converts your live microphone input into that voice with low latency.
+Few-shot, real-time voice conversion for both **speech and singing**. Record a few seconds of a target speaker — the system converts your live microphone input into that voice with low latency. The model is trained on a mixture of VCTK speech data and JVS-MuSiC singing data, enabling vocal conversion across speaking and singing registers.
 
 **Architecture:** Deterministic Transformer Neural Process (TNP-D) — the context encoder learns a content→acoustic mapping function directly from (ContentVec+F0, mel) context pairs extracted from reference utterances. No stochastic sampling; training optimises a single masked L1 reconstruction loss.
 
@@ -316,7 +316,30 @@ tar -xzf train-clean-100.tar.gz -C datasets/
 python train.py --data-root datasets/LibriSpeech/train-clean-100
 ```
 
-**Option C — Custom recordings**
+**Option C — JVS-MuSiC** — 100 Japanese speakers, each with a unique solo-singing recording at 24 kHz.
+
+Download from the [official release](https://sites.google.com/site/shinnosuketakamichi/research-topics/jvs_music) and place the extracted folder at `datasets/jvs_music_ver1/`. Then run the preparation script before preprocessing:
+
+```bash
+# 1. Segment song_unique/wav/raw.wav per speaker on silence/breath boundaries.
+#    Deletes song_common/ (shared-song data) and outputs seg_001.wav … per speaker.
+python prepare_jvs_music.py --data-root datasets/jvs_music_ver1
+
+# 2. (Optional) dry-run first to preview segment counts
+python prepare_jvs_music.py --data-root datasets/jvs_music_ver1 --dry-run
+
+# 3. Cache augmentation + mel as usual
+python preprocess.py --data-root datasets/jvs_music_ver1
+
+# 4. Train on mixed speech + singing
+python train.py --data-root datasets/jvs_music_ver1   # or combine with VCTK via a symlinked root
+```
+
+`prepare_jvs_music.py` produces **1,006 segments** (2–8 s each, 24 kHz) across 100 speakers. The 24 kHz native sample rate is preserved end-to-end by Phase 2 of `preprocess.py`, so no quality is lost compared with the downsampled 16 kHz → 24 kHz path used for VCTK. Since ContentVec and torchcrepe operate at 16 kHz, `dataset.py` resamples on load — no changes to the data pipeline are needed.
+
+> **Why singing data matters:** The model's torchcrepe F0 extractor covers `[50, 1100]` Hz to include the soprano singing range (~1100 Hz). Training on JVS-MuSiC teaches the ContextEncoder to encode a singer's vocal tract shape and register from sung context clips, enabling cross-speaker singing voice conversion alongside speech conversion.
+
+**Option D — Custom recordings**
 
 ```
 datasets/my_data/
@@ -333,6 +356,7 @@ python train.py --data-root datasets/my_data
 |---|---|---|---|
 | VCTK *(default)* | 110 | ~11 GB | `datasets/VCTK-Corpus-0.92/wav48_silence_trimmed` |
 | LibriSpeech `train-clean-100` | 251 | ~6.3 GB | `datasets/LibriSpeech/train-clean-100` |
+| JVS-MuSiC (singing) | 100 | ~0.5 GB (after segmentation) | `datasets/jvs_music_ver1` |
 
 </details>
 

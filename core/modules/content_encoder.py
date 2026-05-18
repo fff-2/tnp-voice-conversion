@@ -1,9 +1,9 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torchaudio
 import torchaudio.functional as AF
 from torch import Tensor
+from transformers import HubertModel as _HubertModel
 
 try:
     import torchcrepe
@@ -19,15 +19,17 @@ try:
 except ImportError:
     _DFN_AVAILABLE = False
 
+CONTENTVEC_MODEL = "lengyue233/content-vec-best"
+
 
 class ContentEncoder(nn.Module):
     """
-    Frozen content encoder: DeepFilterNet3 → HuBERT → torchcrepe F0 → concat.
+    Frozen content encoder: DeepFilterNet3 → ContentVec → torchcrepe F0 → concat.
 
     Sample-rate pipeline:
         input 16 kHz
           → resample 16k→48k → DeepFilterNet3 → resample 48k→16k
-          → HuBERT BASE (layer 6) → [B, T_frames, 768]
+          → ContentVec (last layer) → [B, T_frames, 768]
           → torchcrepe (hop=320) → [B, T_frames, 1]
           → concat → [B, T_frames, 769]
 
@@ -38,8 +40,7 @@ class ContentEncoder(nn.Module):
 
     SR_DFN = 48_000
     SR_HUB = 16_000
-    HUBERT_LAYER_IDX = 5  # 0-based index into extract_features list → layer 6
-    HOP = 320  # samples @ 16kHz; 20ms; matches HuBERT frame stride
+    HOP = 320  # samples @ 16kHz; 20ms; matches ContentVec frame stride
 
     def __init__(self, device: torch.device) -> None:
         super().__init__()
@@ -54,10 +55,11 @@ class ContentEncoder(nn.Module):
             self.dfn_model = None
             self.dfn_state = None
 
-        # ── HuBERT BASE ───────────────────────────────────────────────────────
-        bundle = torchaudio.pipelines.HUBERT_BASE
-        self.hubert = bundle.get_model().to(device)
-        self._freeze(self.hubert)
+        # ── ContentVec ────────────────────────────────────────────────────────
+        # Speaker-disentangled HuBERT fine-tune; last layer used (not layer 6).
+        # Weights are downloaded to ~/.cache/huggingface/ on first run (~360 MB).
+        self.contentvec = _HubertModel.from_pretrained(CONTENTVEC_MODEL).to(device)
+        self._freeze(self.contentvec)
 
         # torchcrepe is function-based (no nn.Module to freeze)
         self._crepe_available = _CREPE_AVAILABLE
@@ -103,19 +105,16 @@ class ContentEncoder(nn.Module):
         return denoised
 
     @torch.no_grad()
-    def _extract_hubert(self, audio_16k: Tensor) -> Tensor:
+    def _extract_contentvec(self, audio_16k: Tensor) -> Tensor:
         """
-        Extract HuBERT layer-6 hidden states.
+        Extract ContentVec last-layer hidden states.
 
         Args:
             audio_16k: [B, T]  normalized float32 16 kHz
         Returns:
             features:  [B, T_frames, 768]
         """
-        # extract_features returns (list_of_layer_features, lengths)
-        # list has 12 elements for HUBERT_BASE (one per transformer layer)
-        features_list, _ = self.hubert.extract_features(audio_16k)
-        return features_list[self.HUBERT_LAYER_IDX]  # [B, T_frames, 768]
+        return self.contentvec(audio_16k).last_hidden_state  # [B, T_frames, 768]
 
     PERIODICITY_THRESHOLD = 0.5  # frames below this confidence are treated as unvoiced
 
@@ -146,7 +145,7 @@ class ContentEncoder(nn.Module):
             sample_rate=self.SR_HUB,
             hop_length=self.HOP,
             fmin=50.0,
-            fmax=550.0,  # speech range (avoids harmonic/octave errors)
+            fmax=1100.0,  # covers speech and singing (soprano ~1100 Hz)
             model="tiny",  # fast inference
             decoder=torchcrepe.decode.argmax,
             return_periodicity=True,
@@ -191,8 +190,8 @@ class ContentEncoder(nn.Module):
         else:
             audio = self._denoise(audio_16k)  # [B, T]
 
-        # Step 2: HuBERT features
-        hubert_feat = self._extract_hubert(audio)  # [B, T_frames, 768]
+        # Step 2: ContentVec features
+        hubert_feat = self._extract_contentvec(audio)  # [B, T_frames, 768]
 
         # Step 3: F0
         if f0_audio_16k is not None:
@@ -283,7 +282,7 @@ class ContentEncoder(nn.Module):
             hub_std:  [1, 768]  per-channel std  (clamped ≥ 1e-4)
             f0:       [1, T_frames, 1]  raw F0 in Hz  (0.0 = unvoiced)
         """
-        hub = self._extract_hubert(audio_16k)  # [1, T, 768]
+        hub = self._extract_contentvec(audio_16k)  # [1, T, 768]
         hub_mean = hub.mean(dim=1)  # [1, 768]
         hub_std = hub.std(dim=1).clamp(min=1e-4)  # [1, 768]
         f0 = self._extract_f0(audio_16k)  # [1, T, 1]

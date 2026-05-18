@@ -108,8 +108,8 @@ def train(args) -> None:
         logger.info(f"Resumed from step {step}")
 
     # ── Dataset & DataLoader ──────────────────────────────────────────────────
-    train_ds = SpeakerDataset(args.data_root, split="train", max_sec=MAX_AUDIO_SEC)
-    val_ds = SpeakerDataset(args.data_root, split="val", max_sec=MAX_AUDIO_SEC)
+    train_ds = SpeakerDataset(args.data_root, split="train", max_sec=MAX_AUDIO_SEC, n_ctx=N_CTX)
+    val_ds = SpeakerDataset(args.data_root, split="val", max_sec=MAX_AUDIO_SEC, n_ctx=N_CTX)
     val_subset = torch.utils.data.Subset(val_ds, range(3, 53))
 
     train_loader = DataLoader(

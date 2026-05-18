@@ -2,10 +2,10 @@
 Audio preprocessing: offline augmentation + GPU mel cache.
 
 Phase 1 — Parselmouth augmentation (CPU, per file):
-    For every audio file, two pitch+formant-shifted variants are saved as
-    16-kHz audio tensors:
-        <stem>_aug_high.pt   formant 1.10–1.25 × pitch 1.10–1.25
-        <stem>_aug_low.pt    formant 0.75–0.90 × pitch 0.75–0.90
+    For every audio file, one pitch+formant-shifted variant is saved as a
+    16-kHz audio tensor alongside the source:
+        <stem>_aug.pt   random direction: pitch Uniform(1.10,1.30) or Uniform(0.70,0.90)
+                                          formant Uniform(1.05,1.15) or Uniform(0.85,0.95)
 
 Phase 2 — GPU mel cache (batched):
     For every clean audio file, a log-mel spectrogram is computed on the GPU:
@@ -13,7 +13,7 @@ Phase 2 — GPU mel cache (batched):
 
 Mel parameters match the Vocos vocoder (vocos-mel-24khz):
     sample_rate=24000, n_fft=1024, hop_length=256, win_length=1024, n_mels=100
-    log scale: log(mel.clamp(min=1e-5))
+    log scale: log(mel.clamp(min=1e-7))
 
 Already-existing .pt files are skipped (safe to interrupt and resume).
 

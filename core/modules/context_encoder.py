@@ -5,19 +5,17 @@ from torch import Tensor
 
 class ContextEncoder(nn.Module):
     """
-    Encodes reference mel spectrograms into a variational context sequence
-    [B, T_ctx, d_model] for TNP cross-attention.
+    Encodes reference (HuBERT+F0, mel) context pairs into a deterministic
+    sequence z [B, T, d_model] for TNP cross-attention.
 
-    Variational bottleneck: the Transformer output is projected to mu and
-    log_var.  During training, z is sampled via the reparameterization trick;
-    during eval, z = mu (deterministic, stable inference).
-
-    No positional encoding (speaker identity is time-invariant).
-    No mean pooling (full sequence for cross-attention, TNP style).
+    Input: concatenated [HuBERT+F0 (769), mel (100)] = 869 dims per frame,
+    channels-last.  No variational bottleneck.  No positional encoding.
+    No mean pooling — full sequence is returned for cross-attention (TNP style).
     """
 
     def __init__(
         self,
+        hubert_dim: int = 769,      # 768 HuBERT + 1 F0
         n_mels: int = 100,
         d_model: int = 256,
         nhead: int = 4,
@@ -27,7 +25,8 @@ class ContextEncoder(nn.Module):
     ) -> None:
         super().__init__()
         self.d_model = d_model
-        self.input_proj = nn.Linear(n_mels, d_model)
+        input_dim = hubert_dim + n_mels              # 869
+        self.input_proj = nn.Linear(input_dim, d_model)
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
             nhead=nhead,
@@ -39,56 +38,33 @@ class ContextEncoder(nn.Module):
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         self.out_norm = nn.LayerNorm(d_model)
 
-        # Variational bottleneck heads
-        self.mu_proj = nn.Linear(d_model, d_model)
-        self.lv_proj = nn.Linear(d_model, d_model)
-
-        # Near-identity init for mu_proj and near-zero variance for lv_proj so
-        # that a checkpoint resumed from the deterministic version continues
-        # with z ≈ mu and std ≈ 0.08 — no disruption to learned representations.
-        nn.init.eye_(self.mu_proj.weight)
-        nn.init.zeros_(self.mu_proj.bias)
-        nn.init.zeros_(self.lv_proj.weight)
-        nn.init.constant_(self.lv_proj.bias, -5.0)
-
     def forward(
-        self, mel: Tensor, src_key_padding_mask: Tensor | None = None
-    ) -> tuple[Tensor, Tensor, Tensor]:
+        self,
+        ctx_pairs: Tensor,                         # [B, T, hubert_dim + n_mels]
+        src_key_padding_mask: Tensor | None = None,
+    ) -> Tensor:                                   # [B, T, d_model]
         """
         Args:
-            mel:                  [B, n_mels, T_ctx]  channels-first
-            src_key_padding_mask: [B, T_ctx]  bool, True = padded position
+            ctx_pairs:            [B, T, input_dim]  channels-last, already concatenated
+            src_key_padding_mask: [B, T]  bool, True = padded position
         Returns:
-            z:       [B, T_ctx, d_model]  sampled latent (= mu during eval)
-            mu:      [B, T_ctx, d_model]  distribution mean
-            log_var: [B, T_ctx, d_model]  log variance, clamped to [-10, 4]
+            z: [B, T, d_model]  deterministic context sequence
         """
-        x = mel.permute(0, 2, 1)                                           # [B, T_ctx, n_mels]
-        x = self.input_proj(x)                                             # [B, T_ctx, d_model]
-        x = self.encoder(x, src_key_padding_mask=src_key_padding_mask)    # [B, T_ctx, d_model]
-        x = self.out_norm(x)
-
-        mu = self.mu_proj(x)                                               # [B, T_ctx, d_model]
-        log_var = self.lv_proj(x).clamp(-10.0, 4.0)                       # [B, T_ctx, d_model]
-
-        if self.training:
-            z = mu + torch.randn_like(mu) * torch.exp(0.5 * log_var)
-        else:
-            z = mu   # deterministic at eval — stable inference
-
-        return z, mu, log_var
+        x = self.input_proj(ctx_pairs)                                      # [B, T, d_model]
+        x = self.encoder(x, src_key_padding_mask=src_key_padding_mask)     # [B, T, d_model]
+        return self.out_norm(x)
 
     @torch.no_grad()
-    def encode_references(self, mels: list) -> Tensor:
+    def encode_references(self, ctx_pairs_list: list) -> Tensor:
         """
-        Inference helper: encode multiple reference utterances and concatenate
-        their frame sequences along the time axis (TNP style).
+        Inference helper: encode a list of pre-built context pair tensors and
+        concatenate their frame sequences along the time axis (TNP style).
 
         Args:
-            mels: list of N tensors, each [1, n_mels, T_i]
+            ctx_pairs_list: list of N tensors, each [1, T_i, hubert_dim + n_mels]
         Returns:
-            C:   [1, T_total, d_model]  z sequences (= mu in eval mode)
+            C: [1, T_total, d_model]
         """
         self.eval()
-        encoded = [self.forward(m)[0] for m in mels]   # z = mu at eval
-        return torch.cat(encoded, dim=1)               # [1, T_total, d_model]
+        encoded = [self.forward(p) for p in ctx_pairs_list]
+        return torch.cat(encoded, dim=1)           # [1, T_total, d_model]

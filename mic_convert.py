@@ -24,7 +24,6 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 import torch
-import torchaudio
 import torchaudio.functional as AF
 
 try:
@@ -137,20 +136,6 @@ def load_wav_reference(path: str, device: torch.device) -> torch.Tensor:
     return wav.to(device)
 
 
-def audio_to_mel(audio: torch.Tensor, device: torch.device) -> torch.Tensor:
-    """[1, T @ 16 kHz] → [1, N_MELS, T_mel] log-mel @ 24 kHz."""
-    audio_24k = AF.resample(audio, SR, VOCODER_SR)
-    tf = torchaudio.transforms.MelSpectrogram(
-        sample_rate=VOCODER_SR,
-        n_fft=1024,
-        hop_length=256,
-        win_length=1024,
-        n_mels=N_MELS,
-        power=1.0,
-        center=True,
-    ).to(device)
-    return torch.log(tf(audio_24k).clamp(min=1e-7))
-
 
 # ── Real-time converter ────────────────────────────────────────────────────────
 
@@ -190,6 +175,9 @@ class RealtimeConverter:
         self._xfade_buf = np.zeros(SOLA_OVERLAP, dtype=np.float32)
         self._fade_in = np.linspace(0.0, 1.0, SOLA_OVERLAP, dtype=np.float32)
         self._fade_out = 1.0 - self._fade_in
+
+        # Accumulation buffer for _infer_thread
+        self._accum = np.zeros(0, dtype=np.float32)
 
         # F0 stats
         self._src_f0_mean: float = 0.0
@@ -642,8 +630,7 @@ def main() -> None:
         sf.write(_ref_tmp, ref_np, SR)
         sys.argv = [sys.argv[0], "--reference", _ref_tmp] + sys.argv[1:]
 
-    ref_mel = audio_to_mel(ref_audio, device)
-    C = model.compute_context([ref_mel])
+    C = model.compute_context([ref_audio])
     print(f"[REF] Context vector ready: {C.shape}, norm={C.norm().item():.3f}")
 
     converter = RealtimeConverter(model=model, C=C, device=device, ref_audio=ref_audio)

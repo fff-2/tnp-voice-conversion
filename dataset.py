@@ -194,7 +194,13 @@ class SpeakerDataset(Dataset):
 
         mels = []
         mel_lens = []
+        ctx_audios_list = []
+        ctx_audio_lens = []
         for i in ctx_indices:
+            ctx_audio = self._load(spk_files[i])          # [T] @ 16kHz
+            ctx_audio_lens.append(ctx_audio.shape[0])
+            ctx_audios_list.append(ctx_audio)
+
             cache = spk_files[i].with_suffix(".pt")
             if cache.exists():
                 mel = torch.load(cache, weights_only=True).float()
@@ -202,19 +208,27 @@ class SpeakerDataset(Dataset):
                     start = random.randint(0, mel.shape[-1] - max_mel_frames)
                     mel = mel[:, start : start + max_mel_frames]
             else:
-                mel = self._mel(self._load(spk_files[i]))
-            mel_lens.append(mel.shape[-1])  # unpadded T for this mel
+                mel = self._mel(ctx_audio)
+            mel_lens.append(mel.shape[-1])
             mels.append(mel)
+
         max_T = max(m.shape[-1] for m in mels)
         context_mels = torch.stack(
             [F.pad(m, (0, max_T - m.shape[-1])) for m in mels]
         )  # [N_CTX, N_MELS, T_ctx]
 
+        max_T_audio = max(a.shape[0] for a in ctx_audios_list)
+        context_audios = torch.stack(
+            [F.pad(a, (0, max_T_audio - a.shape[0])) for a in ctx_audios_list]
+        )  # [N_CTX, T_max_audio]
+
         return {
             "source_audio": source_audio,
             "audio_content": audio_content,
             "context_mels": context_mels,
-            "ctx_mel_lens": mel_lens,  # list[N_CTX] of ints: unpadded T per ref mel
+            "ctx_mel_lens": mel_lens,      # list[N_CTX] unpadded mel-frame counts (for visualization)
+            "context_audios": context_audios,  # [N_CTX, T_max_audio] @ 16kHz
+            "ctx_audio_lens": ctx_audio_lens,  # list[N_CTX] unpadded sample counts
         }
 
 
@@ -230,13 +244,18 @@ def collate_fn(batch: list[dict]) -> dict:
         L = max(m.shape[-1] for m in mels)
         return torch.stack([F.pad(m, (0, L - m.shape[-1])) for m in mels])
 
+    def pad_ctx_audios(audios: list[torch.Tensor]) -> torch.Tensor:
+        # audios[i]: [N_CTX, T_i]
+        L = max(a.shape[-1] for a in audios)
+        return torch.stack([F.pad(a, (0, L - a.shape[-1])) for a in audios])
+
     return {
         "source_audio": pad1d([b["source_audio"] for b in batch]),
         "audio_content": pad1d([b["audio_content"] for b in batch]),
         "context_mels": pad_mels([b["context_mels"] for b in batch]),
+        "context_audios": pad_ctx_audios([b["context_audios"] for b in batch]),  # [B, N_CTX, T]
         "source_lengths": [b["source_audio"].shape[0] for b in batch],
         "content_lengths": [b["audio_content"].shape[0] for b in batch],
-        # list[B] of list[N_CTX]: unpadded mel-frame count per reference utterance.
-        # Used to build key_padding_mask for cross-attention (True = padding position).
-        "ctx_mel_lens": [b["ctx_mel_lens"] for b in batch],
+        "ctx_mel_lens": [b["ctx_mel_lens"] for b in batch],     # for visualization
+        "ctx_audio_lens": [b["ctx_audio_lens"] for b in batch], # for mask construction
     }

@@ -4,6 +4,10 @@ Training script for the voice conversion pipeline.
 Trains the three trainable modules (ContextEncoder, CrossAttentionFusion, MelDecoder)
 against frozen HuBERT content encoder and Vocos vocoder.
 
+TNP-D style: ContextEncoder takes (HuBERT+F0, mel) context pairs from reference
+utterances.  No variational bottleneck; no KL divergence loss.  The model is
+optimised solely on masked L1 reconstruction loss.
+
 VRAM optimizations:
     - AMP (torch.amp.autocast) for bf16 forward/backward
     - Gradient accumulation (physical batch=40, accumulate=2 → effective batch=80)
@@ -27,7 +31,6 @@ import numpy as np
 import soundfile as sf
 import torch
 import torch.nn.functional as F
-import torchaudio
 from loguru import logger
 from torch.utils.data import DataLoader
 
@@ -39,8 +42,8 @@ from dataset import SpeakerDataset, collate_fn
 
 SAMPLE_RATE = 16_000
 VOCODER_SR = 24_000  # mel computation and vocoder output sample rate
-BATCH_SIZE = 32  # physical batch per GPU step — increase to fill VRAM
-GRAD_ACCUM = 2  # effective batch = BATCH_SIZE * GRAD_ACCUM = 32
+BATCH_SIZE = 16  # physical batch per GPU step — increase to fill VRAM
+GRAD_ACCUM = 4  # effective batch = BATCH_SIZE * GRAD_ACCUM = 64
 MAX_STEPS = 100_000
 SAVE_EVERY = 1000
 LOG_EVERY = 50
@@ -49,15 +52,8 @@ WARMUP_STEPS = 1_000
 LR = 1e-4
 WEIGHT_DECAY = 1e-2
 MAX_AUDIO_SEC = 8.0  # longer clips → more HuBERT activations → more VRAM
-N_CTX = 5  # number of context utterances per training sample
+N_CTX = 2  # number of context utterances per training sample
 N_MELS = 100
-
-# ── KL annealing schedule ──────────────────────────────────────────────────────
-# beta=1e-6 for the first KL_ANNEAL_START steps (pure reconstruction warmup),
-# then linearly ramps to KL_BETA_MAX by KL_ANNEAL_END.  Prevents posterior collapse.
-KL_ANNEAL_START = 5_000
-KL_ANNEAL_END = 20_000
-KL_BETA_MAX = 0.0008
 
 
 # ── LR schedule: linear warmup → cosine decay ────────────────────────────────
@@ -68,16 +64,6 @@ def get_lr(step: int, warmup: int, max_steps: int, base_lr: float) -> float:
         return base_lr * step / max(1, warmup)
     progress = (step - warmup) / max(1, max_steps - warmup)
     return base_lr * 0.5 * (1.0 + np.cos(np.pi * progress))
-
-
-def get_beta(step: int) -> float:
-    """Linear KL annealing: 0 → KL_BETA_MAX over [KL_ANNEAL_START, KL_ANNEAL_END]."""
-    # if step < KL_ANNEAL_START:
-    #     return 1e-6
-    # if step >= KL_ANNEAL_END:
-    #     return KL_BETA_MAX
-    # return KL_BETA_MAX * (step - KL_ANNEAL_START) / (KL_ANNEAL_END - KL_ANNEAL_START)
-    return 0.0003
 
 
 # ── Training loop ─────────────────────────────────────────────────────────────
@@ -92,13 +78,14 @@ def train(args) -> None:
     model.train()
     logger.info(f"Trainable parameters: {model.trainable_param_count():,}")
 
-    # ── Optimizer & AMP ───────────────────────────────────────────────────────
+    # ── Optimizer ─────────────────────────────────────────────────────────────
     optimizer = torch.optim.AdamW(
         model.get_trainable_params(),
         lr=LR,
         weight_decay=WEIGHT_DECAY,
         betas=(0.9, 0.98),
     )
+
     # ── Checkpoint resume ─────────────────────────────────────────────────────
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -109,9 +96,7 @@ def train(args) -> None:
     csv_path = output_dir / args.csv_log
     if not csv_path.exists():
         with open(csv_path, "w", newline="") as f:
-            csv.writer(f).writerow(
-                ["step", "train_loss", "val_loss", "learning_rate", "kl_loss", "beta"]
-            )
+            csv.writer(f).writerow(["step", "train_loss", "val_loss", "learning_rate"])
 
     ckpt_path = output_dir / "latest.pt"
     if ckpt_path.exists() and not args.reset:
@@ -146,29 +131,9 @@ def train(args) -> None:
         collate_fn=collate_fn,
     )
 
-    # ── Mel transform on GPU for target mel computation ───────────────────────
-    # Resample 16 kHz audio to 24000 Hz before mel (matches vocos-mel-24khz params)
-    mel_resampler = torchaudio.transforms.Resample(SAMPLE_RATE, VOCODER_SR).to(device)
-    mel_transform = torchaudio.transforms.MelSpectrogram(
-        sample_rate=VOCODER_SR,
-        n_fft=1024,
-        hop_length=256,
-        win_length=1024,
-        n_mels=N_MELS,
-        power=1.0,
-        center=True,
-    ).to(device)
-
-    def compute_target_mel(audio: torch.Tensor) -> torch.Tensor:
-        """[B, T @ 16kHz] → [B, T_mel, N_MELS] log-compressed, channels-last."""
-        mel = mel_transform(mel_resampler(audio))  # [B, N_MELS, T_mel]
-        mel = mel.transpose(1, 2)  # [B, T_mel, N_MELS]
-        return torch.log(mel.clamp(min=1e-7))
-
     # ── Training loop ─────────────────────────────────────────────────────────
     optimizer.zero_grad()
     running_loss = 0.0
-    running_kl = 0.0
     accum_count = 0
 
     while step < MAX_STEPS:
@@ -176,103 +141,26 @@ def train(args) -> None:
             if step >= MAX_STEPS:
                 break
 
-            # ── Bug fix: Reset DFN state for each batch ───────────────────────
-            # Prevent GRU from carrying over state between unrelated random samples
-            model.content_encoder.reset_dfn_state(batch_size=BATCH_SIZE)
-
             source_audio = batch["source_audio"].to(device)  # [B, T] augmented
             content_audio = batch["audio_content"].to(device)  # [B, T] clean target
-            ctx_mels = batch["context_mels"].to(device)  # [B, N_CTX, N_MELS, T_ctx]
-            content_lengths = batch[
-                "content_lengths"
-            ]  # list[int], unpadded sample counts
-            ctx_mel_lens = batch["ctx_mel_lens"]  # list[B] of list[N_CTX] ints
+            ctx_audios = batch["context_audios"].to(device)  # [B, N, T_ctx]
+            content_lengths = batch["content_lengths"]  # list[int]
 
-            B, N, M, T_ctx = ctx_mels.shape
-            # Flatten context batch for context encoder
-            ctx_flat = ctx_mels.view(B * N, M, T_ctx)  # [B*N, N_MELS, T_ctx]
+            B = source_audio.shape[0]
 
             with torch.amp.autocast(
                 "cuda", dtype=torch.bfloat16, enabled=(device.type == "cuda")
             ):
-                # ── Context encoding ──────────────────────────────────────────
-                # Self-attention padding mask for the context encoder Transformer.
-                # Shape [B*N, T_ctx]: flat index i*N+n covers reference mel n of
-                # batch item i; positions beyond ctx_mel_lens[i][n] are zero-padding.
-                ctx_enc_mask = torch.ones(B * N, T_ctx, dtype=torch.bool, device=device)
-                for i in range(B):
-                    for n in range(N):
-                        valid = ctx_mel_lens[i][n]
-                        ctx_enc_mask[i * N + n, :valid] = False
-
-                C_all, mu_all, lv_all = model.context_encoder(
-                    ctx_flat, src_key_padding_mask=ctx_enc_mask
-                )  # each [B*N, T_ctx, d_model]
-                T_ctx_enc = C_all.shape[1]  # == T_ctx (no temporal stride)
-                # Concatenate N reference sequences along the time axis (TNP style),
-                # matching encode_references() used at inference.
-                C = C_all.view(B, N * T_ctx_enc, -1)  # [B, N*T_ctx, d_model]
-                mu_C = mu_all.view(B, N * T_ctx_enc, -1)  # [B, N*T_ctx, d_model]
-                lv_C = lv_all.view(B, N * T_ctx_enc, -1)  # [B, N*T_ctx, d_model]
-
-                # ── Cross-attention padding mask ──────────────────────────────
-                # True = position is zero-padding; prevents it from polluting attention.
-                # Each item i has N mels; mel n occupies positions [n*T_ctx_enc, (n+1)*T_ctx_enc).
-                # Valid frames = ctx_mel_lens[i][n]; remainder is zero-padding.
-                ctx_mask = torch.ones(B, N * T_ctx_enc, dtype=torch.bool, device=device)
-                for i in range(B):
-                    for n in range(N):
-                        valid = ctx_mel_lens[i][n]
-                        ctx_mask[i, n * T_ctx_enc : n * T_ctx_enc + valid] = False
-
-                # ── KL divergence: q(z|C) vs N(0,I) ──────────────────────────
-                # Compute in float32 to avoid bfloat16 precision loss in exp().
-                # Masked so that zero-padded context positions are excluded.
-                mu_f = mu_C.float()
-                lv_f = lv_C.float()
-                kl_raw = -0.5 * (
-                    1.0 + lv_f - mu_f.pow(2) - lv_f.exp()
-                )  # [B, N*T_ctx, d_model]
-                valid_ctx = (~ctx_mask).float()  # [B, N*T_ctx]
-                kl_loss = (kl_raw * valid_ctx.unsqueeze(-1)).sum() / (
-                    valid_ctx.sum() * model.D_MODEL + 1e-8
+                # model.forward() handles all context/content extraction and masking
+                pred_mel, tgt_mel = model(
+                    source_audio,
+                    ctx_audios,
+                    content_audio,
+                    ctx_audio_lens=batch["ctx_audio_lens"],
+                    content_lengths=content_lengths,
                 )
 
-                # ── Content encoding (frozen, no grad) ────────────────────────
-                # source_audio is the Parselmouth-augmented version of the target
-                # utterance.  The model must rely on clean context C to recover
-                # speaker identity rather than copying it from content features.
-                with torch.no_grad():
-                    content = model.content_encoder(
-                        source_audio,
-                        f0_audio_16k=content_audio,
-                        lengths=content_lengths,
-                    )  # [B, T_frames, 769]
-
-                # ── Cross-attention + decode ──────────────────────────────────
-                fused = model.cross_attention(
-                    content, C, key_padding_mask=ctx_mask
-                )  # [B, T_frames, d_model]
-
-                # Content padding mask for the decoder self-attention
-                T_frames = fused.shape[1]
-                content_mask = torch.zeros(B, T_frames, dtype=torch.bool, device=device)
-                for i, L in enumerate(content_lengths):
-                    flen = (L // 320) + 1
-                    if flen < T_frames:
-                        content_mask[i, flen:] = True
-
-                pred_mel = model.decoder(
-                    fused, key_padding_mask=content_mask
-                )  # [B, T_mel_pred, N_MELS]
-
-                # ── Target mel (always from unperturbed content_audio) ────────
-                with torch.no_grad():
-                    tgt_mel = compute_target_mel(
-                        content_audio
-                    )  # [B, T_mel_tgt, N_MELS]
-
-                # ── Masked L1 loss (ignore padded frames) ─────────────────────
+                # ── Masked L1 reconstruction loss ─────────────────────────────
                 T = min(pred_mel.shape[1], tgt_mel.shape[1])
                 mel_lengths = [
                     1 + math.ceil(n_samples * VOCODER_SR / SAMPLE_RATE) // 256
@@ -287,17 +175,14 @@ def train(args) -> None:
                 recon_loss = (loss_raw * mask.unsqueeze(-1)).sum() / (
                     mask.sum() * N_MELS + 1e-8
                 )
-                beta = get_beta(step)
-                loss = (recon_loss + beta * kl_loss) / GRAD_ACCUM
+                loss = recon_loss / GRAD_ACCUM
 
             loss.backward()
             running_loss += recon_loss.item()
-            running_kl += kl_loss.item()
             accum_count += 1
 
             # ── Optimizer step every GRAD_ACCUM mini-batches ─────────────────
             if accum_count % GRAD_ACCUM == 0:
-                # Update LR
                 lr = get_lr(step, WARMUP_STEPS, MAX_STEPS, LR)
                 for pg in optimizer.param_groups:
                     pg["lr"] = lr
@@ -312,20 +197,12 @@ def train(args) -> None:
                 # ── Logging ───────────────────────────────────────────────────
                 if step % LOG_EVERY == 0:
                     avg_recon = running_loss / (LOG_EVERY * GRAD_ACCUM)
-                    avg_kl = running_kl / (LOG_EVERY * GRAD_ACCUM)
                     running_loss = 0.0
-                    running_kl = 0.0
-                    cur_beta = get_beta(step)
-                    logger.info(
-                        f"step={step:6d}  recon={avg_recon:.4f}"
-                        f"  kl={avg_kl:.4f}  beta={cur_beta:.4f}  lr={lr:.2e}"
-                    )
+                    logger.info(f"step={step:6d}  recon={avg_recon:.4f}  lr={lr:.2e}")
 
                     if step % CSV_LOG_EVERY == 0:
                         with open(csv_path, "a", newline="") as f:
-                            csv.writer(f).writerow(
-                                [step, avg_recon, last_val_loss, lr, avg_kl, cur_beta]
-                            )
+                            csv.writer(f).writerow([step, avg_recon, last_val_loss, lr])
 
                 # ── Checkpointing ─────────────────────────────────────────────
                 if step % SAVE_EVERY == 0:
@@ -333,8 +210,6 @@ def train(args) -> None:
                         model,
                         val_loader,
                         device,
-                        mel_transform,
-                        mel_resampler,
                         step=step,
                         output_dir=output_dir,
                     )
@@ -364,8 +239,6 @@ def _validate(
     model: VoiceConversionModel,
     loader: DataLoader,
     device: torch.device,
-    mel_transform,
-    mel_resampler,
     step: int = 0,
     output_dir: Path = None,
 ) -> float:
@@ -377,52 +250,29 @@ def _validate(
     for batch in loader:
         source = batch["source_audio"].to(device)
         content_audio = batch["audio_content"].to(device)
-
-        B_val = source.shape[0]
-        model.content_encoder.reset_dfn_state(batch_size=B_val)
-
-        ctx_mels = batch["context_mels"].to(device)
+        ctx_audios = batch["context_audios"].to(device)  # [B, N, T_ctx]
+        ctx_mels = batch["context_mels"].to(
+            device
+        )  # [B, N, N_MELS, T_mel] — visualization only
 
         source_lengths = batch["source_lengths"]
         content_lengths = batch["content_lengths"]
-        ctx_mel_lens = batch["ctx_mel_lens"]  # list[B] of list[N_CTX] ints
-        B, N, M, T_ctx = ctx_mels.shape
-        ctx_flat = ctx_mels.view(B * N, M, T_ctx)
+        ctx_mel_lens = batch["ctx_mel_lens"]
+
+        B = content_audio.shape[0]
 
         with torch.amp.autocast(
             "cuda", dtype=torch.bfloat16, enabled=(device.type == "cuda")
         ):
-            ctx_enc_mask = torch.ones(B * N, T_ctx, dtype=torch.bool, device=device)
-            for i in range(B):
-                for n in range(N):
-                    valid = ctx_mel_lens[i][n]
-                    ctx_enc_mask[i * N + n, :valid] = False
+            # Validation: use clean content_audio as both source and target
+            pred_mel, tgt_mel = model(
+                content_audio,
+                ctx_audios,
+                content_audio,
+                ctx_audio_lens=batch["ctx_audio_lens"],
+                content_lengths=content_lengths,
+            )
 
-            C_all, _, _ = model.context_encoder(
-                ctx_flat, src_key_padding_mask=ctx_enc_mask
-            )  # [B*N, T_ctx, d_model]  (mu/lv not needed at eval)
-            T_ctx_enc = C_all.shape[1]
-            C = C_all.view(B, N * T_ctx_enc, -1)  # [B, N*T_ctx, d_model]
-
-            ctx_mask = torch.ones(B, N * T_ctx_enc, dtype=torch.bool, device=device)
-            for i in range(B):
-                for n in range(N):
-                    valid = ctx_mel_lens[i][n]
-                    ctx_mask[i, n * T_ctx_enc : n * T_ctx_enc + valid] = False
-
-            content = model.content_encoder(content_audio, lengths=content_lengths)
-            fused = model.cross_attention(content, C, key_padding_mask=ctx_mask)
-
-            T_frames = fused.shape[1]
-            content_mask = torch.zeros(B, T_frames, dtype=torch.bool, device=device)
-            for i, L in enumerate(content_lengths):
-                flen = (L // 320) + 1
-                if flen < T_frames:
-                    content_mask[i, flen:] = True
-
-            pred_mel = model.decoder(fused, key_padding_mask=content_mask)
-            tgt_mel = mel_transform(mel_resampler(content_audio)).transpose(1, 2)
-            tgt_mel = torch.log(tgt_mel.clamp(min=1e-7))
             T = min(pred_mel.shape[1], tgt_mel.shape[1])
             mel_lengths = [
                 1 + math.ceil(n_samples * VOCODER_SR / SAMPLE_RATE) // 256
@@ -445,7 +295,6 @@ def _validate(
             sample_dir = output_dir / "samples" / f"step_{step}"
             sample_dir.mkdir(parents=True, exist_ok=True)
 
-            # Raw waveforms at 16 kHz (first item of first batch, unpadded)
             src_len = source_lengths[0]
             tgt_len = content_lengths[0]
             sf.write(
@@ -479,36 +328,39 @@ def _validate(
                         float(max(tgt_v.std(), 5.0)),
                     )
 
-            # Converted: source content + target speaker C → vocoder (24000 Hz out)
+            # Converted: source content + target speaker context → vocoder
             with torch.amp.autocast(
                 "cuda", dtype=torch.bfloat16, enabled=(device.type == "cuda")
             ):
+                # Build per-speaker context from raw reference audio
+                N = ctx_audios.shape[1]
+                ref_list = [
+                    ctx_audios[0, n : n + 1, : batch["ctx_audio_lens"][0][n]]
+                    for n in range(N)
+                ]
+                C_sample = model.compute_context(ref_list)  # [1, T_total, D_MODEL]
+
                 model.content_encoder.reset_dfn_state(batch_size=1)
-                src_content = model.content_encoder(
-                    source[0:1, :src_len], f0_stats=sample_f0_stats
+                wav = model.convert_chunk(
+                    source[0:1, :src_len], C_sample, f0_stats=sample_f0_stats
                 )
-                src_fused = model.cross_attention(
-                    src_content, C[0:1], key_padding_mask=ctx_mask[0:1]
-                )
-                src_mel = model.decoder(src_fused)
-                wav = model.vocoder(src_mel.transpose(1, 2))  # [1, 1, T_wav]
             sf.write(
                 str(sample_dir / "converted.wav"),
                 wav[0, 0, :].cpu().numpy(),
-                VOCODER_SR,
+                model.VOCODER_SR,
             )
 
             # context.wav: first reference clip decoded through Vocos
             ctx_len_frames = ctx_mel_lens[0][0]
             ctx_mel_sample = ctx_mels[0, 0, :, :ctx_len_frames].unsqueeze(0).float()
-            ctx_wav = model.vocoder(ctx_mel_sample)  # [1, 1, T_wav]
+            ctx_wav = model.vocoder(ctx_mel_sample)
             sf.write(
                 str(sample_dir / "context.wav"),
                 ctx_wav[0, 0, :].cpu().numpy(),
-                VOCODER_SR,
+                model.VOCODER_SR,
             )
 
-        if num_batches >= 50:  # cap validation batches for speed
+        if num_batches >= 50:
             break
 
     return total_loss / max(1, num_batches)

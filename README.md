@@ -1,8 +1,8 @@
-# Real-Time Voice Conversion Pipeline — Variational TNP
+# Real-Time Voice Conversion Pipeline — Deterministic TNP-D
 
 Few-shot, real-time voice conversion. Record a few seconds of a target speaker — the system converts your live microphone input into that voice with low latency.
 
-**Architecture:** Variational Transformer Neural Process — the context encoder outputs a stochastic latent sequence `z ~ q(z|C) = N(μ, σ²)` trained with an ELBO (masked L1 reconstruction + KL divergence). At inference `z = μ`, fully deterministic and stable for streaming.
+**Architecture:** Deterministic Transformer Neural Process (TNP-D) — the context encoder learns a content→acoustic mapping function directly from (HuBERT+F0, mel) context pairs extracted from reference utterances. No stochastic sampling; training optimises a single masked L1 reconstruction loss.
 
 ---
 
@@ -41,9 +41,9 @@ unzip VCTK-Corpus-0.92.zip -d datasets/
 # 4. Preprocess: generate augmented audio tensors + cache mels on GPU
 python preprocess.py --data-root datasets/wav48_silence_trimmed
 
-python train.py                                                    # train
+python train.py --reset                                            # train from scratch
 python mic_convert.py --checkpoint checkpoints/best.pt            # real-time
-python convert.py --source me.wav --reference alice.wav --output out.wav # offline
+                                 --output out.wav # offline
 ```
 
 ---
@@ -57,6 +57,7 @@ python convert.py --source me.wav --reference alice.wav --output out.wav # offli
 voice/
 ├── environment.yml             # Conda environment (Python 3.12, PyTorch + CUDA 12.8)
 ├── datasets/                   # All datasets go here
+├── augmentation.py             # Parselmouth pitch+formant augmentation (used by preprocess.py)
 ├── dataset.py                  # Generic speaker-folder dataset for training
 ├── preprocess.py               # GPU-accelerated mel preprocessing (optional, speeds up training)
 ├── train.py                    # Training loop (AMP + gradient accumulation)
@@ -68,13 +69,13 @@ voice/
 │   ├── latest.pt
 │   └── samples/step_N/         # Qualitative audio saved every SAVE_EVERY steps
 │       ├── source.wav
-│       ├── context.wav      
+│       ├── context.wav
 │       ├── target.wav
 │       └── converted.wav
 │
 ├── core/
 │   ├── modules/
-│   │   ├── context_encoder.py  # Transformer, no PE/mean-pool → μ, log σ² → z [B, T_ctx, 256]
+│   │   ├── context_encoder.py  # Transformer, no PE/mean-pool; (content, mel) pairs → z [B, T_h, 256]
 │   │   ├── content_encoder.py  # DeepFilterNet3 + HuBERT (InstanceNorm) + torchcrepe F0
 │   │   ├── cross_attention.py  # Q=hubert_proj(h)+f0_proj(f0), K/V=C, separate projections
 │   │   └── decoder.py          # Conv1d + Transformer + 1.875× upsample → Mel [100]
@@ -92,28 +93,35 @@ voice/
 ## Architecture
 
 ```
-TARGET SPEAKER (reference audio)
+TARGET SPEAKER (N reference utterances)
         │
-        ▼
-┌─────────────────────┐
-│   Context Encoder   │  Transformer (4 layers), no positional encoding
-│     (Trainable)     │  [B, 100, T_ctx] → μ, log σ² → z [B, T_ctx, 256]
-│                     │  (training: z sampled; inference: z = μ, deterministic)
-└─────────────────────┘
-        │  z (computed once, cached per speaker)
-        ▼
-SOURCE SPEAKER (live mic / audio file)
+        ├──→ [ContentEncoder: HuBERT+F0]  ──→ content_ctx [B*N, T_h, 769]
+        │         (frozen, no grad)
+        └──→ [Mel transform, downsample]  ──→ mel_ctx     [B*N, T_h, 100]
+                                                               │
+                                            concat ──→ ctx_pairs [B*N, T_h, 869]
+                                                               │
+                                                               ▼
+                                                 ┌─────────────────────┐
+                                                 │   Context Encoder   │  Transformer (4 layers)
+                                                 │     (Trainable)     │  no positional encoding
+                                                 │                     │  [B*N, T_h, 869] → z [B*N, T_h, 256]
+                                                 └─────────────────────┘
+                                                        │  C = reshape to [B, N·T_h, 256]
+                                                        │  (computed once, cached per speaker)
+                                                        ▼
+SOURCE SPEAKER (augmented audio)
         │
         ▼
 ┌─────────────────────┐
 │   Content Encoder   │  DeepFilterNet3 → HuBERT (layer 6) → torchcrepe F0
 │      (Frozen)       │  [B, T @ 16 kHz] → [B, T_frames, 769]
 └─────────────────────┘
-        │
+        │  content_tgt (Query)
         ▼
 ┌─────────────────────┐
-│  Cross-Attention    │  Q = hubert_proj(h) + f0_proj(f0), K=V=C (TNP style)
-│    (Trainable)      │  separate projections balance HuBERT and F0 signal magnitudes
+│  Cross-Attention    │  Q = content_tgt,  K = V = C  (TNP style)
+│    (Trainable)      │  Q: hubert_proj(h) + f0_proj(f0)
 └─────────────────────┘
         │
         ▼
@@ -134,12 +142,14 @@ SOURCE SPEAKER (live mic / audio file)
 
 | Module | Trainable | Parameters |
 |---|---|---|
-| ContextEncoder (Transformer + μ/log σ² heads) | Yes | ~3.3 M |
+| ContextEncoder (Transformer, input 869→256) | Yes | ~3.2 M |
 | CrossAttentionFusion (hubert_proj + f0_proj + MHA + FFN) | Yes | ~1.0 M |
 | MelDecoder | Yes | ~2.6 M |
 | ContentEncoder (DFN3 + HuBERT + crepe) | No | ~122 M |
 | VocosVocoder | No | ~13.4 M |
-| **Total trainable** | | **~6.9 M (~26 MB fp32)** |
+| **Total trainable** | | **~6.8 M (~26 MB fp32)** |
+
+**Temporal alignment:** HuBERT outputs at 50 fps (stride 320 @ 16 kHz). Mel is computed at ~93.75 fps (hop 256 @ 24 kHz). Reference mels are downsampled to HuBERT rate via `F.interpolate(mode='linear')` inside `model.forward()` before concatenation with content features.
 
 ---
 
@@ -156,28 +166,33 @@ VCTK and LibriSpeech are **non-parallel**: each speaker says different sentences
 The training loop uses a **self-reconstruction** objective to sidestep the parallel-data problem. For each training sample, one speaker and one utterance are selected:
 
 - `source_audio` — the **Parselmouth-augmented** version of the utterance (pitch + formant shifted). Used to extract **phonetic content** (HuBERT).
-- `audio_content` — the **clean** version of the same utterance. Used to extract the **true pitch contour** (F0) and as the mel reconstruction target.
-- `context_mels` — N_CTX=5 **clean** reference utterances from the same speaker (always different clips).
+- `audio_content` — the **clean** version of the same utterance. Used as the reconstruction target (mel ground truth) and to extract the **true pitch contour** (F0).
+- `context_audios` — N_CTX=5 **clean** reference utterances from the same speaker (always different clips). Each provides a (HuBERT+F0, mel) pair showing how the target speaker maps content to acoustics.
 
 ```
-Training forward pass
+Training forward pass (TNP-D)
 ─────────────────────────────────────────────────────────────────────
-source_audio   ──→  [ContentEncoder: HuBERT]  ──→  phonetic features
+context_audios ──→ [ContentEncoder: HuBERT+F0]  ──→ content_ctx [B*N, T_h, 769]
+  (clean refs)  └→ [Mel transform + downsample]  ──→ mel_ctx     [B*N, T_h, 100]
+                                                            │
+                                                 concat → ctx_pairs [B*N, T_h, 869]
+                                                            │
+                                              ┌─────────────────────┐
+                                              │  Context Encoder    │  Learns the mapping rule
+                                              │  (Transformer)      │  content → acoustic
+                                              └─────────────────────┘
+                                                            │ C  [B, N·T_h, 256]
+
+source_audio   ──→ [ContentEncoder: HuBERT]  ──→  phonetic features  (Query)
   (augmented)       (InstanceNorm strips per-sample timbre)
 
-audio_content  ──→  [ContentEncoder: Crepe]   ──→  F0 (true pitch contour)
+audio_content  ──→ [ContentEncoder: Crepe]   ──→  F0 (true pitch contour)  (Query)
   (clean)
 
-context_mels   ──→  [ContextEncoder Transformer]
-  (clean)           ──→  μ [B, T_ctx, 256],  log σ² [B, T_ctx, 256]
-                    ──→  z = μ + ε·σ,  ε ~ N(0, I)   ← reparameterization trick
+phonetics + F0 ──→ [CrossAttention + Decoder]  ──→  pred_mel
+   + C (context)
 
-phonetics + F0 ──→  [CrossAttention + Decoder]  ──→  pred_mel
-   + z (Context)
-
-ELBO loss:  L1( pred_mel,  mel(audio_content) )          ← reconstruction
-          + β · KL( q(z|C) || N(0,I) )                  ← KL divergence
-          β: 0 for steps 0–5000, linear ramp → 0.01 by step 20000 (KL annealing)
+Loss: Masked L1( pred_mel,  mel(audio_content) )          ← reconstruction only
 ```
 
 Because prediction and ground truth come from the same speaker, the loss is phonetically valid. The augmented source has different pitch and formant characteristics from the clean context clips — the model cannot copy timbre from content features and must consult `C` to reconstruct the correct spectral shape.
@@ -187,15 +202,23 @@ At **inference time** the roles switch to the intended conversion task:
 ```
 Inference forward pass
 ─────────────────────────────────────────────────────────────────────
-source_audio  ──→  [ContentEncoder]  ──→  content features (source phonetics)
-reference     ──→  [ContextEncoder]  ──→  C  (target speaker embedding)
+reference_audios  ──→  [ContentEncoder + Mel]  ──→  C  (target speaker context)
+source_audio      ──→  [ContentEncoder]        ──→  content features (source phonetics)
 
 content + C   ──→  [CrossAttention + Decoder]  ──→  converted mel
 ```
 
+### Why TNP-D: learning a mapping function, not an embedding
+
+A classic speaker embedding (d-vector, x-vector) compresses all N reference utterances into a single fixed-size vector. That vector must encode the speaker's full acoustic identity in limited dimensions, discarding temporal detail.
+
+TNP-D instead treats the N reference utterances as a **context set** of input→output pairs: each pair `(content_ctx_i, mel_ctx_i)` is a direct observation of how the target speaker maps phonetic content to acoustic output at frame i. The ContextEncoder's Transformer attends over all these pairs jointly and outputs a full sequence `C [B, N·T_h, 256]` — a *function representation* rather than a fixed-size code. CrossAttentionFusion then uses the source content as a query against this function representation to predict the target speaker's mel for each source frame.
+
+This formulation is strictly more expressive: the model can exploit fine-grained co-variation between content and acoustics in the reference set, rather than averaging it into a single vector.
+
 ### Why HuBERT makes this work
 
-HuBERT is pre-trained with a masked-prediction objective on large-scale speech, so its internal representations correlate with phonemes more than with speaker acoustics. Feeding `audio_content` through HuBERT produces features that carry the *content* of the utterance while discarding much of the speaker-specific spectral shape. Without that bottleneck the model could learn to copy the input and ignore `C` entirely.
+HuBERT is pre-trained with a masked-prediction objective on large-scale speech, so its internal representations correlate with phonemes more than with speaker acoustics. Feeding audio through HuBERT produces features that carry the *content* of the utterance while discarding much of the speaker-specific spectral shape. Without that bottleneck the model could learn to copy the input and ignore `C` entirely.
 
 ### Copy-synthesis risk
 
@@ -204,21 +227,13 @@ HuBERT layer-6 features are not perfectly speaker-agnostic — some identity lea
 **Signs:** converted audio sounds like the source, not the target; validation loss is low but listening tests are poor.
 
 **Mitigation 1 — HuBERT Instance Normalization:**
-The content encoder applies `F.instance_norm` to HuBERT features before the F0 concat. It normalises each `(sample, channel)` pair to mean=0 / std=1 across the time dimension, stripping the per-sample spectral bias that encodes speaker timbre. This is a hard constraint: the model *cannot* reconstruct speaker identity from content features alone and must consult `C` via cross-attention. See the Implementation Notes for technical details.
+The content encoder applies `F.instance_norm` to HuBERT features before the F0 concat. It normalises each `(sample, channel)` pair to mean=0 / std=1 across the time dimension, stripping the per-sample spectral bias that encodes speaker timbre. This is a hard constraint: the model *cannot* reconstruct speaker identity from content features alone and must consult `C` via cross-attention.
 
 **Mitigation 2 — Offline Pitch + Formant Augmentation:**
-`preprocess.py` pre-generates one Parselmouth-augmented variant per audio file (`_aug.pt`). Pitch and formant shift directions are sampled independently at random: pitch `Uniform(1.10, 1.30)` or `Uniform(0.70, 0.90)`; formant `Uniform(1.05, 1.15)` or `Uniform(0.85, 0.95)`. During training, this augmented audio is fed into the HuBERT content encoder. The aggressive pitch and formant shifts alter the vocal tract shape and fundamental frequency, effectively destroying the speaker identity in the source audio so it doesn't leak through the HuBERT features. Meanwhile, the *true* pitch contour is extracted from the clean target audio (`audio_content`) and provided directly to the decoder. This ensures the decoder learns to perfectly respect the F0 input (instead of blurring the pitch to minimize L1 error), while still being forced to rely entirely on `z` for the speaker's vocal tract and timbre.
+`preprocess.py` pre-generates one Parselmouth-augmented variant per audio file (`_aug.pt`). Pitch and formant shift directions are sampled independently at random: pitch `Uniform(1.10, 1.30)` or `Uniform(0.70, 0.90)`; formant `Uniform(1.05, 1.15)` or `Uniform(0.85, 0.95)`. During training, this augmented audio is fed into the HuBERT content encoder. The aggressive pitch and formant shifts alter the vocal tract shape and fundamental frequency, effectively destroying the speaker identity in the source audio so it doesn't leak through the HuBERT features. Meanwhile, the *true* pitch contour is extracted from the clean target audio (`audio_content`) and provided directly to the decoder. This ensures the decoder learns to perfectly respect the F0 input (instead of blurring the pitch to minimize L1 error), while still being forced to rely entirely on `C` for the speaker's vocal tract and timbre.
 
-**Mitigation 3 — Variational KL Bottleneck (Stochastic TNP):**
-The context encoder applies a variational bottleneck after its Transformer layers. Instead of producing a single deterministic representation, it outputs `μ` and `log σ²` (each `[B, T_ctx, 256]`) and samples `z = μ + ε·σ` via the reparameterization trick. The ELBO adds a KL divergence penalty between `q(z|C) = N(μ, σ²)` and the isotropic prior `p(z) = N(0, I)`:
-
-```
-KL = -0.5 · mean( 1 + log σ² − μ² − σ² )   [closed-form, per valid frame]
-```
-
-This regularises the context representation toward the prior — the encoder cannot produce arbitrarily sharp, data-memorising embeddings. At inference `z = μ` exactly (model in `eval()` mode), so the pipeline is fully deterministic and streaming-safe. The two linear projection heads (`μ_proj`, `log σ²_proj`) are initialised as near-identity so resuming from a deterministic checkpoint causes zero disruption to learned representations on the first step.
-
-**KL Annealing** prevents posterior collapse (the encoder collapsing to the prior with `μ = 0`, `σ = 1` to zero out the KL term): β starts at 0 for the first 5 000 steps (pure reconstruction warmup), then linearly ramps to `β_max = 0.01` by step 20 000 and remains constant thereafter.
+**Mitigation 3 — TNP-D Context Pairs as an Explicit Mapping Bottleneck:**
+By requiring the ContextEncoder to distil the target speaker's voice from (content, mel) pairs rather than mel alone, the model is forced to learn a *conditional* mapping rule. Any content information present in the source that was not seen in the reference context pairs cannot be attributed to the target speaker — the context set acts as an explicit prior over what acoustic features are speaker-specific vs. content-specific.
 
 ---
 
@@ -276,10 +291,9 @@ conda env create -f environment.yml
 For each training sample it picks a speaker and an utterance from that speaker:
 
 - `source_audio` — the **Parselmouth-augmented** version of that utterance (`_aug.pt`), loaded as a 16 kHz audio tensor. Feeds into the content encoder. Falls back to the clean file if the augmented tensor has not been generated yet.
-- `audio_content` — the **clean** version of the same utterance. Used as the reconstruction target (mel ground truth).
-- `context_mels` — `N_CTX=5` **clean** reference utterances from the same speaker (always different clips), loaded from cached mel `.pt` files where available.
-
-Context mels are computed at 24 kHz (100-band log-mel, `n_fft=1024`, `hop=256`, `power=1.0`) to match the Vocos vocoder.
+- `audio_content` — the **clean** version of the same utterance. Used as the reconstruction target (mel ground truth) and for F0 extraction.
+- `context_audios` — N_CTX=5 **clean** reference utterances from the same speaker (always different clips), returned as raw 16 kHz waveforms. Used to extract (HuBERT+F0, mel) context pairs in `model.forward()`.
+- `context_mels` — pre-cached log-mel spectrograms of the same N_CTX reference clips (loaded from `.pt` files where available). Kept in the batch for validation visualization only — not used in the forward pass.
 
 <details>
 <summary>Dataset options and download commands</summary>
@@ -333,12 +347,13 @@ ds     = SpeakerDataset("datasets/VCTK-Corpus-0.92/wav48_silence_trimmed", split
 loader = DataLoader(ds, batch_size=8, collate_fn=collate_fn, shuffle=True)
 
 batch = next(iter(loader))
-print(batch["source_audio"].shape)   # [B, T_src]  — zero-padded to batch max
-print(batch["audio_content"].shape)  # [B, T_content] — target speaker content clip
-print(batch["context_mels"].shape)   # [B, N_CTX, 100, T_ctx]
-print(batch["source_lengths"])       # list[B]: unpadded sample count per source
-print(batch["content_lengths"])      # list[B]: unpadded sample count per content clip
-print(batch["ctx_mel_lens"])         # list[B] of list[N_CTX]: unpadded T per ref mel
+print(batch["source_audio"].shape)    # [B, T_src]  — zero-padded to batch max
+print(batch["audio_content"].shape)   # [B, T_content]
+print(batch["context_audios"].shape)  # [B, N_CTX, T_ctx]  — raw 16 kHz reference audio
+print(batch["context_mels"].shape)    # [B, N_CTX, 100, T_mel]  — cached mels (visualization)
+print(batch["content_lengths"])       # list[B]: unpadded sample count per content clip
+print(batch["ctx_audio_lens"])        # list[B] of list[N_CTX]: unpadded sample count per ref
+print(batch["ctx_mel_lens"])          # list[B] of list[N_CTX]: unpadded mel frames per ref
 ```
 
 </details>
@@ -411,16 +426,16 @@ Computing mel spectrograms on the CPU inside the DataLoader is the primary bottl
 Trains ContextEncoder, CrossAttentionFusion, and MelDecoder with bfloat16 AMP and gradient accumulation. ContentEncoder and Vocos remain frozen throughout.
 
 ```bash
-python train.py                               # VCTK default
+python train.py --reset                       # train from scratch (required: new architecture)
 python train.py --data-root datasets/my_data  # custom dataset
-python train.py --reset                       # ignore existing checkpoint
+python train.py                               # resume from latest.pt
 ```
+
+> **Note:** Checkpoints from the previous VAE architecture are **incompatible** with the TNP-D model (`ContextEncoder.input_proj` changed from 256×100 to 256×869). Always use `--reset` when starting fresh after the architecture change.
 
 Checkpoints are written to `checkpoints/`:
 - `latest.pt` — every 1 000 steps, used for resuming
 - `best.pt` — whenever validation loss improves, used for inference
-
-To resume training from the last checkpoint, just run `python train.py` again — it picks up `checkpoints/latest.pt` automatically.
 
 ### Training log CSV
 
@@ -432,8 +447,6 @@ Every 50 steps (`CSV_LOG_EVERY`), a row is appended to `checkpoints/training_log
 | `train_loss` | Average masked L1 reconstruction loss over the last 50 steps |
 | `val_loss` | Most recent validation loss (carries forward between checkpoints) |
 | `learning_rate` | Current LR after warmup / cosine schedule |
-| `kl_loss` | Average KL divergence (per valid frame-element) over the last 50 steps |
-| `beta` | Current KL annealing weight β (0 → 0.01 between steps 5 000 and 20 000) |
 
 The file is created with a header on first run and **appended** on resume — rows are never overwritten. Change the filename with `--csv-log`:
 
@@ -516,18 +529,17 @@ Press `Ctrl+C` to stop.
 **Pipeline:**
 
 ```
-Microphone  →  mic_queue  →  Inference thread  →  Jitter buffer  →  Speaker
-[1024 samples/callback]   [accumulate 2560]   [5-chunk pre-fill]
+Microphone  →  mic_queue  →  Inference thread  →  out_queue  →  Speaker
+[960 samples/callback]    [accumulate 4800]
 ```
 
 | Stage | Time |
 |---|---|
-| Mic accumulation (2 560 samples) | ~160 ms |
+| Mic accumulation (`BLOCK` = 4 800 samples) | ~300 ms |
 | GPU inference (DFN3 + HuBERT + decode + vocoder) | ~25 ms |
-| Jitter buffer pre-fill (5 chunks) | ~320 ms |
-| **Total steady-state** | **~210 ms** |
+| **Total steady-state** | **~325 ms** |
 
-`PROC_SAMPLES` must be a multiple of **2 560** to avoid fractional Vocos mel frames (see *Streaming chunk size constraint* in Implementation Notes). Vocos outputs at 24 kHz; the processing thread resamples back to 16 kHz for playback so you can use a standard 16 kHz output device.
+Vocos outputs at 24 kHz; the inference thread resamples back to 16 kHz before writing to the output queue. Output is clipped to exactly `BLOCK` samples per iteration to prevent drift.
 
 </details>
 
@@ -538,7 +550,6 @@ Microphone  →  mic_queue  →  Inference thread  →  Jitter buffer  →  Spea
 Converts an audio file without a microphone or server. Useful for evaluating a checkpoint before moving to real-time use.
 
 ```bash
-
 python convert.py --source me.wav --reference alice_1.wav alice_2.wav alice_3.wav --output converted.wav
 ```
 
@@ -620,6 +631,8 @@ Feeding 16 kHz directly into DFN3 produces silent garbage with no error.
 
 In streaming mode the DFN GRU must only advance over **new** audio. `mic_convert.py` calls `content_encoder._denoise()` on the raw non-overlapping chunk before prepending the denoised overlap for HuBERT context. Feeding the overlap prefix into DFN would process the same timeline twice, destroying the GRU state. The dedicated `VoiceConversionModel.convert_chunk_streaming()` method accepts pre-denoised audio and takes `skip_denoise=True` through to `ContentEncoder.forward()` so DFN is never called twice.
 
+`model.forward()` calls `reset_dfn_state(batch_size=B*N)` before encoding N reference utterances, then `reset_dfn_state(batch_size=B)` before encoding source audio. This ensures independent GRU state for each call.
+
 **HuBERT layer index**
 `HUBERT_BASE.extract_features()` returns a list of 12 tensors (one per transformer layer). Index `5` (0-based) is transformer layer 6 — the correct layer for mid-level linguistic content.
 
@@ -650,6 +663,8 @@ To prevent the decoder from ignoring F0 inputs, it must receive the exact target
 - *Training*: `f0_audio_16k` is set to the clean target audio (`audio_content`). The model routes the *true* pitch contour to the decoder without any math, teaching the decoder to trust and trace the F0 harmonics sharply.
 - *Inference*: The target audio doesn't exist yet, so `f0_audio_16k` is omitted. The F0 is extracted from the source audio and mathematically shifted using the `f0_stats` Z-score calculation to match the target speaker's range. From the decoder's perspective, both pipelines provide a perfectly valid target pitch contour.
 
+For reference context encoding, `content_encoder(ctx_flat, f0_audio_16k=ctx_flat)` — F0 is extracted from the same clean reference audio, no shift applied.
+
 **Separate HuBERT / F0 projection in CrossAttentionFusion (Signal Drowning Fix)**
 The content vector fed to `CrossAttentionFusion` has shape `[B, T_frames, 769]` — 768 HuBERT channels followed by 1 log-F0 channel. A naïve single `nn.Linear(769, d_model)` projection applies the same Xavier initialisation variance (`~1/769`) to all 769 inputs. Because HuBERT contributes 768 columns while F0 contributes only 1, the total output variance driven by HuBERT is **768× larger** than the F0 signal at step 0 — the F0 is effectively drowned out, and the model converges to a blurry local minimum that ignores pitch entirely.
 
@@ -659,7 +674,7 @@ self.hubert_proj = nn.Linear(768, d_model)   # variance ∝ 1/768
 self.f0_proj     = nn.Linear(1,   d_model)   # variance ∝ 1/1  ← 768× larger weights
 Q = self.hubert_proj(content[..., :768]) + self.f0_proj(content[..., 768:])
 ```
-The `f0_proj` fan-in of 1 means its weights are initialised ~28× larger in magnitude, amplifying the F0 signal to match the aggregate HuBERT signal power. The final expressible function is mathematically identical to a single `nn.Linear(769, d_model)` with manually set row-wise variances — but the split makes the initialisation automatic and PyTorch-idiomatic. This matches the approach used in RVC, VITS, and FastSpeech 2.
+The `f0_proj` fan-in of 1 means its weights are initialised ~28× larger in magnitude, amplifying the F0 signal to match the aggregate HuBERT signal power. The final expressible function is mathematically identical to a single `nn.Linear(769, d_model)` with manually set row-wise variances — but the split makes the initialisation automatic and PyTorch-idiomatic.
 
 **F0 decoder — argmax, not Viterbi**
 `torchcrepe` is configured with `decoder=torchcrepe.decode.argmax`. Viterbi is a global dynamic-programming algorithm that requires the full sequence and is incompatible with chunk-by-chunk streaming. Argmax is frame-independent and causal.
@@ -667,12 +682,10 @@ The `f0_proj` fan-in of 1 means its weights are initialised ~28× larger in magn
 **F0 frame alignment**
 `torchcrepe.predict(..., hop_length=320)` and HuBERT both have a 320-sample stride, producing `T // 320` frames each. If you ever change one, change both — mismatched strides cause silent feature misalignment at concatenation.
 
-**Context encoder — variational bottleneck, no positional encoding, no mean pooling**
+**Context encoder — deterministic TNP-D, no positional encoding, no mean pooling**
 Speaker identity (timbre, vocal tract shape) is time-invariant. Absolute positional encoding was removed so the model cannot overfit on the temporal position of phonemes in the reference clip. Mean pooling was also removed: `ContextEncoder` outputs a full sequence so `CrossAttentionFusion` can attend over all reference frames (TNP style).
 
-After the Transformer and `LayerNorm`, two linear heads project to `μ [B, T_ctx, 256]` and `log σ² [B, T_ctx, 256]`. The sampled latent `z = μ + ε·σ` replaces the old deterministic output as the K/V sequence for cross-attention. In `eval()` mode `z = μ` — no randomness in inference. The `log σ²` output is clamped to `[-10, 4]` (σ ∈ `[0.007, 7.4]`) to prevent numerical explosion before the KL `exp()`.
-
-The two new projection heads are initialised specially to avoid disrupting a resumed checkpoint: `μ_proj` starts as an identity matrix (so `μ = x` on step 0), `log σ²_proj` starts with zero weights and bias `−5` (so `σ ≈ 0.08` — nearly no noise). The training signal immediately corrects these from the first gradient step.
+The input to `ContextEncoder` is a concatenated `(HuBERT+F0, mel)` pair of shape `[B, T_h, 869]`, where mel has been downsampled from 93.75 fps to HuBERT rate (50 fps) via `F.interpolate`. The `input_proj = nn.Linear(869, 256)` maps this to d_model. No variational bottleneck — the output `z` is fully deterministic, making both training and inference identical in behaviour.
 
 **HuBERT Instance Normalization**
 `F.instance_norm` is applied to HuBERT features `[B, 768, T_frames]` before the F0 concat. It normalises each `(sample, channel)` pair to mean=0 / std=1 across the time dimension, stripping the per-sample spectral bias that encodes speaker timbre. Combined with the offline pitch+formant augmentation, this is the primary hard constraint preventing copy-synthesis from the content stream.
@@ -680,17 +693,23 @@ The two new projection heads are initialised specially to avoid disrupting a res
 **Masked L1 loss**
 The training loss is computed only over valid (non-padded) mel frames. `collate_fn` returns `content_lengths` (original audio sample counts for the content clip); the training loop converts these to mel frame counts and builds a boolean mask before calling `F.l1_loss(..., reduction="none")`. Padding regions contain `log(1e-7) ≈ −16.1` and would otherwise waste model capacity if included in the loss.
 
-**ELBO — KL divergence and annealing**
-The total training loss is the ELBO: `recon_loss + β · kl_loss`. The KL term is also masked — padded context positions are excluded via `~ctx_mask` before summing:
-```python
-kl_raw   = -0.5 * (1.0 + lv_f - mu_f.pow(2) - lv_f.exp())  # [B, N*T_ctx, d_model]
-valid    = (~ctx_mask).float()                                # 1 = valid, 0 = padding
-kl_loss  = (kl_raw * valid.unsqueeze(-1)).sum() / (valid.sum() * D_MODEL + 1e-8)
-```
-KL is computed in float32 (explicit `.float()` cast inside the bfloat16 autocast block) to avoid precision loss in the `exp()` call. `β = get_beta(step)` implements linear annealing: 0 for steps 0–5 000, linear ramp to 0.01 by step 20 000, constant at 0.01 thereafter. Both `recon_loss` and the KL term are divided by `GRAD_ACCUM` before `.backward()` to keep gradient scale correct under accumulation.
-
 **Batch padding and lengths**
 `collate_fn` zero-pads `source_audio` and `audio_content` to the batch maximum length. `source_lengths` and `content_lengths` are returned alongside the padded tensors so callers can recover the unpadded region. When saving validation audio samples, `source[0, :source_lengths[0]]` and `content_audio[0, :content_lengths[0]]` are used — feeding the full padded tensor (including zero-padding) into HuBERT causes garbage features for the silent tail, producing silence in the converted output after the real audio ends.
+
+**Two separate padding masks for context — self-attention and cross-attention**
+Context audios are zero-padded in two places: within `__getitem__` (clips within an item padded to the item-level maximum T) and in `collate_fn` (items padded to the batch-level maximum T). Padding must be excluded from *both* the context encoder's self-attention and the cross-attention fusion. These require masks of different shapes.
+
+`model.forward()` builds both masks internally from `ctx_audio_lens` (unpadded sample counts per reference):
+```python
+# ctx_enc_mask:   [B*N, T_h]   — for ContextEncoder self-attention
+# ctx_cross_mask: [B, N*T_h]   — for CrossAttentionFusion key_padding_mask
+for i in range(B):
+    for n in range(N):
+        flen = min((ctx_audio_lens[i][n] // 320) + 1, T_h)
+        ctx_enc_mask[i * N + n, :flen]               = False
+        ctx_cross_mask[i, n * T_h : n * T_h + flen]  = False
+```
+At inference, `encode_references()` processes one utterance at a time — no padding, no mask needed.
 
 **Vocos input format**
 The decoder outputs `[B, T_mel, 100]` (channels-last). Vocos expects `[B, 100, T_mel]` (channels-first). Always transpose before calling the vocoder: `vocoder(mel.transpose(1, 2))`.
@@ -698,14 +717,10 @@ The decoder outputs `[B, T_mel, 100]` (channels-last). Vocos expects `[B, 100, T
 **Mel decoder upsample factor**
 HuBERT produces ~50 frames/s (stride 320 @ 16 kHz). Vocos requires ~93.75 frames/s (24 000 Hz / hop 256). The decoder uses `scale_factor = 24000 / (256 × 50) = 1.875` to bridge this gap.
 
-**Streaming chunk size constraint**
-`nn.Upsample(scale_factor=1.875)` floors its output size. For N HuBERT frames, the Vocos input has `floor(N × 1.875)` mel frames, which is only an integer when `N` is a multiple of 8 (since 1.875 = 15/8). The streaming constants are chosen so that:
-```
-PROC_SAMPLES = 2560 → 2560 / 320 = 8 HuBERT frames
-8 × 1.875 = 15 Vocos mel frames  (exact — no floor loss)
-15 × hop 256 = 3840 @ 24 kHz  →  × (16/24) = 2560 @ 16 kHz = PROC_SAMPLES ✓
-```
-The 1 280-sample HuBERT overlap is trimmed at the **content tensor** level (4 frames discarded before the decoder), so the decoder always sees exactly 8 frames regardless of overlap size. Do not set `PROC_SAMPLES` to a value where `PROC_SAMPLES / 320` is not a multiple of 8 — it will cause a fractional mel frame count, floor rounding, and a permanent per-chunk sample deficit that accumulates as audio drift.
+**Streaming chunk size**
+`BLOCK = 4800` samples (300 ms @ 16 kHz) → 15 HuBERT frames per block. `15 × 1.875 = 28.125` mel frames, which floors to 28. The output waveform is therefore slightly shorter than the input block on some iterations; `_process_block()` clips or zero-pads to exactly `BLOCK` samples before the crossfade so that no drift accumulates in the output pipe.
+
+*Strictly exact alignment* requires `BLOCK / 320` to be a multiple of 8 (so that `N × 1.875` is an integer). The next exact value above the current `BLOCK=4800` is `BLOCK=5120` (16 frames → 30 mel frames exactly). Changing `BLOCK` also requires adjusting the `CHUNK` I/O granularity so that `BLOCK` is an integer multiple of `CHUNK`.
 
 **Gradient accumulation — scale all loss terms**
 The training loss is divided by `GRAD_ACCUM` before `.backward()`. If you add a second loss term (e.g. speaker loss), apply the same scaling: `(l1 + 0.1 * spk_loss) / GRAD_ACCUM`. Forgetting this makes the effective learning rate `GRAD_ACCUM×` too large.
@@ -718,45 +733,15 @@ HuBERT features must be normalised per-channel to strip residual speaker timbre.
 
 *Training* — `F.instance_norm` over the full sequence: normalises each `(sample, channel)` pair across all T frames, giving mean=0 / std=1 per channel. Stable because sequences are 100–400 frames long.
 
-*Streaming* — only 8 frames per chunk. Computing `F.instance_norm` on 8 frames is catastrophic: during silence the denominator is near-zero and the output explodes; even during speech the statistics are wildly noisy frame-to-frame. Instead, `ContentEncoder.forward()` accepts `hubert_stats=(mean, std)` as `[1, 1, 768]` tensors:
-```python
-hubert_norm = (hubert_feat - hub_mean) / (hub_std + 1e-5)
-```
-`mic_convert.py` maintains a per-channel EMA (`momentum=0.95`, τ ≈ 3 s) of the raw HuBERT channel statistics, updated each chunk via `content_encoder.extract_streaming_stats()`. The EMA stats are passed into `convert_chunk_streaming()` → `content_encoder.forward()` after a `STATS_WARMUP=15` chunk (~2.4 s) period, during which the pipeline falls back to per-chunk `instance_norm`.
+*Streaming* — `mic_convert.py` calls `model.convert_chunk()` with blocks of 15 HuBERT frames. `ContentEncoder.forward()` applies `F.instance_norm` over the full block sequence, which is short but stable enough at 15 frames for practical use. For sub-8-frame blocks, `instance_norm` would be noisy and the EMA `hubert_stats` path in `ContentEncoder.forward()` should be used instead.
 
 **TNP training / inference consistency**
-At inference `encode_references()` calls `self.eval()` first (so `z = μ`, deterministic), then **concatenates** N reference sequences along the time axis: `torch.cat(encoded, dim=1)` → `[1, N·T_ctx, 256]`. The training loop mirrors this exactly — context encoder output is reshaped, not averaged:
+At inference `encode_references()` processes each reference audio through `compute_context()`, which calls ContentEncoder + mel + align + concat → ContextEncoder for each clip independently, then **concatenates** the N sequences along the time axis: `torch.cat(encoded, dim=1)` → `[1, N·T_h, 256]`. The training loop mirrors this exactly — context encoder output is reshaped, not averaged:
 ```python
-# train.py — context encoder returns (z, mu, log_var), each [B*N, T_ctx, d_model]
-C_all, mu_all, lv_all = model.context_encoder(ctx_flat, src_key_padding_mask=ctx_enc_mask)
-C    = C_all.view(B, N * T_ctx_enc, -1)   # [B, N·T_ctx, d_model]  ← concatenate, not mean
-mu_C = mu_all.view(B, N * T_ctx_enc, -1)  # for KL computation
-lv_C = lv_all.view(B, N * T_ctx_enc, -1)
+# model.forward() — context encoder output [B*N, T_h, d_model]
+C_all = self.context_encoder(ctx_pairs, src_key_padding_mask=ctx_enc_mask)
+C = C_all.view(B, N * T_h, -1)   # [B, N·T_h, d_model]  ← concatenate, not mean
 ```
-During validation the model is in `eval()`, so `z = μ` and `_validate()` discards `mu_all`/`lv_all` with `C_all, _, _ = ...`.
-
-**Two separate padding masks for context — self-attention and cross-attention**
-Context mels are zero-padded in two places: within `__getitem__` (different mels padded to the item-level maximum T) and in `collate_fn` (items padded to the batch-level maximum T). Padding must be excluded from *both* the context encoder's self-attention and the cross-attention fusion. These require masks of different shapes and must be built separately.
-
-`dataset.py` records the unpadded length of every reference mel as `ctx_mel_lens: list[N_CTX]` per item. `collate_fn` aggregates it into `ctx_mel_lens: list[B][N_CTX]`. The training loop builds both masks:
-```python
-# ── 1. Context encoder self-attention mask — shape [B*N, T_ctx] ──────────────
-# ctx_flat is [B*N, N_MELS, T_ctx]: flat index i*N+n = reference n of item i.
-ctx_enc_mask = torch.ones(B * N, T_ctx, dtype=torch.bool, device=device)
-for i in range(B):
-    for n in range(N):
-        ctx_enc_mask[i * N + n, :ctx_mel_lens[i][n]] = False
-C_all = model.context_encoder(ctx_flat, src_key_padding_mask=ctx_enc_mask)
-
-# ── 2. Cross-attention key_padding_mask — shape [B, N*T_ctx] ─────────────────
-# C is [B, N*T_ctx, d_model]: N reference sequences concatenated along time.
-ctx_mask = torch.ones(B, N * T_ctx_enc, dtype=torch.bool, device=device)
-for i in range(B):
-    for n in range(N):
-        ctx_mask[i, n * T_ctx_enc : n * T_ctx_enc + ctx_mel_lens[i][n]] = False
-model.cross_attention(content, C, key_padding_mask=ctx_mask)
-```
-Without the self-attention mask, zero-padded frames in the context encoder corrupt the speaker embeddings before they even reach cross-attention. At inference, `encode_references()` processes one utterance at a time — no padding, both masks are `None`.
 
 </details>
 
@@ -776,19 +761,24 @@ import torch
 from core.model import VoiceConversionModel
 from core.modules.context_encoder import ContextEncoder
 
-m     = VoiceConversionModel(torch.device("cuda"))
-audio = torch.randn(1, 3200).cuda()
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+m = VoiceConversionModel(device)
 
-# Variational context encoder: forward() returns (z, mu, log_var)
-enc  = ContextEncoder().cuda().eval()
-mel  = torch.randn(1, 100, 150).cuda()
-z, mu, lv = enc(mel)
-print("z shape:", z.shape)          # [1, 150, 256]
-print("z == mu at eval:", torch.allclose(z, mu))   # True
+# Deterministic context encoder: forward() returns a single Tensor
+enc = ContextEncoder().to(device).eval()
+ctx_pairs = torch.randn(2, 50, 869).to(device)   # [B, T_h, 769+100]
+z = enc(ctx_pairs)
+print("z shape:", z.shape)          # [2, 50, 256]
+assert isinstance(z, torch.Tensor), "expected Tensor, not tuple"
+
+# Determinism check: same input → same output
+z2 = enc(ctx_pairs)
+print("Deterministic:", torch.allclose(z, z2))   # True
 
 # Full pipeline via pre-cached context
-C   = torch.randn(1, 750, 256).cuda()   # [1, T_ctx, D_MODEL]
-out = m.convert_chunk(audio, C)
+audio = torch.randn(1, 3200).to(device)
+C     = torch.randn(1, 750, 256).to(device)   # [1, T_ctx, D_MODEL]
+out   = m.convert_chunk(audio, C)
 print("Output shape:", out.shape)   # [1, 1, T_wav @ 24 kHz]
 EOF
 
@@ -797,10 +787,12 @@ python - <<'EOF'
 from dataset import SpeakerDataset
 ds = SpeakerDataset("datasets/VCTK-Corpus-0.92/wav48_silence_trimmed", split="train")
 s  = ds[0]
-print("source_audio:", s["source_audio"].shape)
-print("audio_content:", s["audio_content"].shape)
-print("context_mels:", s["context_mels"].shape)   # [N_CTX, 100, T_ctx]
-print("ctx_mel_lens:", s["ctx_mel_lens"])          # list[N_CTX] of ints
+print("source_audio:",   s["source_audio"].shape)
+print("audio_content:",  s["audio_content"].shape)
+print("context_audios:", s["context_audios"].shape)   # [N_CTX, T_audio]
+print("context_mels:",   s["context_mels"].shape)     # [N_CTX, 100, T_mel]
+print("ctx_audio_lens:", s["ctx_audio_lens"])          # list[N_CTX] of ints
+print("ctx_mel_lens:",   s["ctx_mel_lens"])            # list[N_CTX] of ints
 EOF
 ```
 

@@ -23,7 +23,6 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 import torch
-import torchaudio
 import torchaudio.functional as AF
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -45,15 +44,6 @@ def load_audio(path: str, device: torch.device) -> torch.Tensor:
         wav = AF.resample(wav, sr, SAMPLE_RATE)
     return wav.to(device)                    # [1, T]
 
-
-def audio_to_mel(audio: torch.Tensor, device: torch.device) -> torch.Tensor:
-    """[1, T @ 16kHz] → [1, N_MELS, T_mel] log mel at 24000 Hz, on device."""
-    audio_24k = AF.resample(audio, SAMPLE_RATE, VOCODER_SR)
-    mel_transform = torchaudio.transforms.MelSpectrogram(
-        sample_rate=VOCODER_SR, n_fft=1024, hop_length=256, win_length=1024, n_mels=N_MELS, power=1.0, center=True,
-    ).to(device)
-    mel = mel_transform(audio_24k)           # [1, N_MELS, T_mel]
-    return torch.log(mel.clamp(min=1e-7))
 
 
 def extract_f0_stats(audio: torch.Tensor, model) -> tuple | None:
@@ -86,14 +76,10 @@ def convert(args) -> None:
     # ── Compute context vector C from reference audio(s) ─────────────────────
     print(f"Computing speaker context from {len(args.reference)} reference file(s) …")
     ref_audios = []
-    ref_mels = []
     for ref_path in args.reference:
-        ref_audio = load_audio(ref_path, device)   # [1, T]
-        ref_audios.append(ref_audio)
-        ref_mel = audio_to_mel(ref_audio, device)  # [1, N_MELS, T_mel]
-        ref_mels.append(ref_mel)
+        ref_audios.append(load_audio(ref_path, device))   # [1, T]
 
-    C = model.compute_context(ref_mels)            # [1, T_ctx, d_model]
+    C = model.compute_context(ref_audios)          # [1, T_ctx, d_model]
     print(f"Context vector computed: {C.shape}")
 
     # Target speaker F0 stats (from all reference audio concatenated)

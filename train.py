@@ -1,12 +1,13 @@
 """
 Training script for the voice conversion pipeline.
 
-Trains the three trainable modules (ContextEncoder, CrossAttentionFusion, MelDecoder)
-against frozen HuBERT content encoder and Vocos vocoder.
+Trains TNPUnifiedTransformer against frozen ContentEncoder (HuBERT/DFN3/crepe)
+and Vocos vocoder.
 
-TNP-D style: ContextEncoder takes (HuBERT+F0, mel) context pairs from reference
-utterances.  No variational bottleneck; no KL divergence loss.  The model is
-optimised solely on masked L1 reconstruction loss.
+Strict TNP-D: context (HuBERT+F0, mel) and target (HuBERT+F0) tokens are
+concatenated into one sequence with a block attention mask — context sees only
+context, each target token sees all context plus itself only.  No variational
+bottleneck; optimised solely on masked L1 reconstruction loss.
 
 VRAM optimizations:
     - AMP (torch.amp.autocast) for bf16 forward/backward

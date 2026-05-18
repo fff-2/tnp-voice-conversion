@@ -12,6 +12,9 @@ Binary WebSocket protocol:
 
 Start the server:
     uvicorn server.app:app --host 0.0.0.0 --port 8000
+
+Speaker registration:
+    POST /register with a WAV file → model.compute_context([waveform_16k]) cached as C.
 """
 
 import asyncio
@@ -27,6 +30,7 @@ import numpy as np
 import soundfile as sf
 import torch
 import torchaudio
+import torchaudio.functional
 from fastapi import FastAPI, File, Form, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from loguru import logger
@@ -49,18 +53,15 @@ N_MELS = 100
 app = FastAPI(title="Voice Conversion Server")
 _model: Optional[VoiceConversionModel] = None
 _device: Optional[torch.device] = None
-_speaker_contexts: dict[str, torch.Tensor] = {}   # speaker_id → C [1, 256]
+_speaker_contexts: dict[str, torch.Tensor] = {}   # speaker_id → C [1, N*T_h, D_MODEL]
 _executor: Optional[ThreadPoolExecutor] = None
-
-# Mel transform for speaker registration (converts reference WAV → mel)
-_mel_transform: Optional[torchaudio.transforms.MelSpectrogram] = None
 
 
 # ── Startup / shutdown ────────────────────────────────────────────────────────
 
 @app.on_event("startup")
 async def startup() -> None:
-    global _model, _device, _executor, _mel_transform
+    global _model, _device, _executor
 
     _device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Using device: {_device}")
@@ -77,11 +78,6 @@ async def startup() -> None:
         logger.warning("No checkpoint found — running with random trainable weights")
 
     _model.eval()
-
-    _mel_transform = torchaudio.transforms.MelSpectrogram(
-        sample_rate=VOCODER_SR, n_fft=1024, hop_length=256, win_length=1024, n_mels=N_MELS, power=1.0, center=True,
-    ).to(_device)
-
     _executor = ThreadPoolExecutor(max_workers=4)
     logger.info("Server ready.")
 
@@ -96,26 +92,18 @@ async def shutdown() -> None:
 
 def _compute_context_sync(wav_bytes: bytes, speaker_id: str) -> torch.Tensor:
     """
-    Blocking: decode WAV bytes → mel → context vector C.
+    Blocking: decode WAV bytes → raw 16kHz waveform → context embeddings C.
     Runs inside ThreadPoolExecutor so it doesn't block the event loop.
     """
     buf = io.BytesIO(wav_bytes)
-    waveform, sr = torchaudio.load(buf)     # [C, T]
-    # Downmix to mono
+    waveform, sr = torchaudio.load(buf)                          # [C, T]
     if waveform.shape[0] > 1:
-        waveform = waveform.mean(dim=0, keepdim=True)   # [1, T]
-    # Resample to 16 kHz if necessary
+        waveform = waveform.mean(dim=0, keepdim=True)            # [1, T]
     if sr != SAMPLE_RATE:
         waveform = torchaudio.functional.resample(waveform, sr, SAMPLE_RATE)
-    waveform = waveform.to(_device)   # [1, T]
+    waveform = waveform.to(_device)                              # [1, T] @ 16kHz
 
-    # Resample to 24000 Hz for mel (matches vocos-mel-24khz training params)
-    waveform_24k = torchaudio.functional.resample(waveform, SAMPLE_RATE, VOCODER_SR)
-    mel = _mel_transform(waveform_24k)             # [1, N_MELS, T_mel]
-    mel = torch.log(mel.clamp(min=1e-7))
-
-    # Compute context vector
-    C = _model.compute_context([mel])  # [1, D_MODEL]
+    C = _model.compute_context([waveform])                       # [1, T_ctx, D_MODEL]
     logger.info(f"Registered speaker '{speaker_id}', C.shape={C.shape}")
     return C
 

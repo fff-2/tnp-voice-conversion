@@ -2,7 +2,7 @@
 
 Few-shot, real-time voice conversion for both **speech and singing**. Record a few seconds of a target speaker — the system converts your live microphone input into that voice with low latency. The model is trained on a mixture of VCTK speech data and JVS-MuSiC singing data, enabling vocal conversion across speaking and singing registers.
 
-**Architecture:** Deterministic Transformer Neural Process (TNP-D) — the context encoder learns a content→acoustic mapping function directly from (ContentVec+F0, mel) context pairs extracted from reference utterances. No stochastic sampling; training optimises a single masked L1 reconstruction loss.
+**Architecture:** Deterministic Transformer Neural Process (TNP-D) — context (ContentVec+F0, mel) tokens and target (ContentVec+F0) tokens are concatenated into one sequence and processed by a single shared Transformer with a block attention mask: context tokens see only context, each target token sees all context plus only itself (conditional independence). No stochastic sampling; training optimises a single masked L1 reconstruction loss.
 
 ---
 
@@ -75,10 +75,8 @@ voice/
 │
 ├── core/
 │   ├── modules/
-│   │   ├── context_encoder.py  # Transformer, no PE/mean-pool; (content, mel) pairs → z [B, T_h, 256]
-│   │   ├── content_encoder.py  # DeepFilterNet3 + ContentVec (InstanceNorm) + torchcrepe F0
-│   │   ├── cross_attention.py  # Q=hubert_proj(h)+f0_proj(f0), K/V=C, separate projections
-│   │   └── decoder.py          # Conv1d + Transformer + 1.875× upsample → Mel [100]
+│   │   ├── tnp_unified.py      # TNPUnifiedTransformer: ctx_proj + tgt_proj + 8-layer Transformer + mel_proj
+│   │   └── content_encoder.py  # DeepFilterNet3 + ContentVec (InstanceNorm) + torchcrepe F0
 │   ├── model.py                # Full pipeline wrapper
 │   └── vocoder.py              # Vocos vocoder wrapper (frozen, 24 kHz)
 │
@@ -95,61 +93,66 @@ voice/
 ```
 TARGET SPEAKER (N reference utterances)
         │
-        ├──→ [ContentEncoder: ContentVec+F0]  ──→ content_ctx [B*N, T_h, 769]
-        │         (frozen, no grad)
-        └──→ [Mel transform, downsample]  ──→ mel_ctx     [B*N, T_h, 100]
-                                                               │
-                                            concat ──→ ctx_pairs [B*N, T_h, 869]
-                                                               │
-                                                               ▼
-                                                 ┌─────────────────────┐
-                                                 │   Context Encoder   │  Transformer (4 layers)
-                                                 │     (Trainable)     │  no positional encoding
-                                                 │                     │  [B*N, T_h, 869] → z [B*N, T_h, 256]
-                                                 └─────────────────────┘
-                                                        │  C = reshape to [B, N·T_h, 256]
-                                                        │  (computed once, cached per speaker)
-                                                        ▼
-SOURCE SPEAKER (augmented audio)
-        │
-        ▼
-┌─────────────────────┐
-│   Content Encoder   │  DeepFilterNet3 → ContentVec (last layer) → torchcrepe F0
-│      (Frozen)       │  [B, T @ 16 kHz] → [B, T_frames, 769]
-└─────────────────────┘
-        │  content_tgt (Query)
-        ▼
-┌─────────────────────┐
-│  Cross-Attention    │  Q = content_tgt,  K = V = C  (TNP style)
-│    (Trainable)      │  Q: hubert_proj(h) + f0_proj(f0)
-└─────────────────────┘
-        │
-        ▼
-┌─────────────────────┐
-│    Mel Decoder      │  Conv1d × 3 + Transformer × 2 + 1.875× upsample
-│    (Trainable)      │  [B, T_frames, 256] → [B, T_mel, 100]
-└─────────────────────┘
-        │
-        ▼
-┌─────────────────────┐
-│   Vocos Vocoder     │  charactr/vocos-mel-24khz (frozen)
-│      (Frozen)       │  [B, 100, T_mel] → [B, 1, T_wav @ 24 kHz]
-└─────────────────────┘
-        │
-        ▼
-   CONVERTED AUDIO
+        ├──→ ContentEncoder (frozen) ──→ ctx_content [B*N, T_h, 769]
+        └──→ Mel + F.interpolate     ──→ ctx_mel     [B*N, T_h, 100]
+                        └── concat ──→ ctx_pairs  [B*N, T_h, 869]
+                                              │  ctx_proj
+                                              ▼
+                                       ctx_enc [B*N, T_h, 512]
+                                              │  reshape
+                                              ▼
+                                       [B, N·T_h, 512]  ───────────────────┐
+                                                                            │  cat(dim=1)
+SOURCE SPEAKER (augmented audio)                                            │
+        │                                                                   │
+        ▼                                                                   │
+ContentEncoder (frozen)                                                     │
+[B, T @ 16 kHz] → content [B, T_hub, 769]                                  │
+        │  tgt_proj                                                         │
+        ▼                                                                   │
+  [B, T_hub, 512]  ─────────────────────────────────────────────────────►  │
+                                                                            ▼
+                                                           [B, N·T_h + T_hub, 512]
+                                                                            │
+                                           ┌────────────────────────────────────────┐
+                                           │       TNPUnifiedTransformer            │
+                                           │     (d=512, 8 heads, 8 layers)         │
+                                           │                                        │
+                                           │  TNP-D attention mask:                 │
+                                           │  ┌─────────────┬─────────────┐        │
+                                           │  │ ctx → ctx   │ ctx → tgt   │        │
+                                           │  │   full  ○   │  blocked ✗  │        │
+                                           │  ├─────────────┼─────────────┤        │
+                                           │  │ tgt → ctx   │ tgt → tgt   │        │
+                                           │  │   full  ○   │ diagonal ◑  │        │
+                                           │  └─────────────┴─────────────┘        │
+                                           └────────────────────────────────────────┘
+                                                                            │
+                                                          take target [B, T_hub, 512]
+                                                                            │
+                                                        1.875× upsample + mel_proj
+                                                                            ▼
+                                                                    [B, T_mel, 100]
+                                                                            │
+                                           ┌────────────────────────────────────────┐
+                                           │      Vocos Vocoder (frozen)            │
+                                           │  [B, 100, T_mel] → [B, 1, T_wav]      │
+                                           └────────────────────────────────────────┘
+                                                                            │
+                                                                    CONVERTED AUDIO
 ```
 
 | Module | Trainable | Parameters |
 |---|---|---|
-| ContextEncoder (Transformer, input 869→256) | Yes | 3,382,272 |
-| CrossAttentionFusion (hubert_proj + f0_embed + MHA + FFN) | Yes | 1,118,208 |
-| MelDecoder | Yes | 2,591,076 |
-| ContentEncoder (DFN3 + ContentVec + crepe) | No | ~94 M |
-| VocosVocoder | No | ~13.4 M |
-| **Total trainable** | | **7,091,556 (~27 MB fp32)** |
+| ctx_proj  Linear(869 → 512) | Yes | 445,440 |
+| tgt_proj  Linear(769 → 512) | Yes | 394,240 |
+| Transformer × 8 layers (d=512, heads=8, ff=2048) | Yes | 25,219,072 |
+| out_norm + mel_proj  Linear(512 → 100) | Yes | 52,324 |
+| ContentEncoder (DFN3 + ContentVec + crepe) | No | ~94.4 M |
+| VocosVocoder | No | ~13.5 M |
+| **Total trainable** | | **26,111,076 (~99.6 MB fp32)** |
 
-**Temporal alignment:** ContentVec outputs at 50 fps (stride 320 @ 16 kHz). Mel is computed at ~93.75 fps (hop 256 @ 24 kHz). Reference mels are downsampled to ContentVec rate via `F.interpolate(mode='linear')` inside `model.forward()` before concatenation with content features.
+**Temporal alignment:** ContentVec outputs at 50 fps (stride 320 @ 16 kHz). Mel is computed at ~93.75 fps (hop 256 @ 24 kHz). Reference mels are downsampled to ContentVec rate via `F.interpolate(mode='linear')` before concatenation. After the transformer, target features are upsampled back to mel rate (`scale_factor = 1.875`) inside `TNPUnifiedTransformer` before `mel_proj`.
 
 ---
 
@@ -172,25 +175,26 @@ The training loop uses a **self-reconstruction** objective to sidestep the paral
 ```
 Training forward pass (TNP-D)
 ─────────────────────────────────────────────────────────────────────
-context_audios ──→ [ContentEncoder: ContentVec+F0]  ──→ content_ctx [B*N, T_h, 769]
-  (clean refs)  └→ [Mel transform + downsample]  ──→ mel_ctx     [B*N, T_h, 100]
-                                                            │
-                                                 concat → ctx_pairs [B*N, T_h, 869]
-                                                            │
-                                              ┌─────────────────────┐
-                                              │  Context Encoder    │  Learns the mapping rule
-                                              │  (Transformer)      │  content → acoustic
-                                              └─────────────────────┘
-                                                            │ C  [B, N·T_h, 256]
+context_audios ──→ ContentEncoder (ContentVec+F0)  ──→ ctx_content [B*N, T_h, 769]
+  (clean refs)  └→ Mel + downsample               ──→ ctx_mel     [B*N, T_h, 100]
+                                       concat → ctx_pairs [B*N, T_h, 869]
+                                                   │ ctx_proj + reshape
+                                                   ▼  ctx_enc [B, N·T_h, 512]
 
-source_audio   ──→ [ContentEncoder: ContentVec]  ──→  phonetic features  (Query)
-  (augmented)          (InstanceNorm strips per-sample timbre)
+source_audio   ──→ ContentEncoder (ContentVec+InstanceNorm)  ──→  [B, T_hub, 769]
+  (augmented)
 
-audio_content  ──→ [ContentEncoder: Crepe]   ──→  F0 (true pitch contour)  (Query)
+audio_content  ──→ ContentEncoder (Crepe F0)  ──→  F0 appended to ContentVec
   (clean)
 
-phonetics + F0 ──→ [CrossAttention + Decoder]  ──→  pred_mel
-   + C (context)
+                    tgt_proj → [B, T_hub, 512]
+
+──────── cat(dim=1) ─────────────────────────────────────────────────────
+[B, N·T_h + T_hub, 512]
+        │
+  TNPUnifiedTransformer (d=512, 8 heads, 8 layers, TNP-D mask)
+        │
+  take target portion → upsample → mel_proj → pred_mel [B, T_mel, 100]
 
 Loss: Masked L1( pred_mel,  mel(audio_content) )          ← reconstruction only
 ```
@@ -202,19 +206,19 @@ At **inference time** the roles switch to the intended conversion task:
 ```
 Inference forward pass
 ─────────────────────────────────────────────────────────────────────
-reference_audios  ──→  [ContentEncoder + Mel]  ──→  C  (target speaker context)
-source_audio      ──→  [ContentEncoder]        ──→  content features (source phonetics)
+reference_audios  ──→  ContentEncoder + Mel  ──→  ctx_proj  ──→  C [1, N·T_h, 512]
+                                                  (cached once per speaker)
 
-content + C   ──→  [CrossAttention + Decoder]  ──→  converted mel
+source_audio  ──→  ContentEncoder  ──→  tgt_proj  ──→  [1, T_hub, 512]
+                                │
+                                └── concat with C → TNPUnifiedTransformer → converted mel
 ```
 
 ### Why TNP-D: learning a mapping function, not an embedding
 
 A classic speaker embedding (d-vector, x-vector) compresses all N reference utterances into a single fixed-size vector. That vector must encode the speaker's full acoustic identity in limited dimensions, discarding temporal detail.
 
-TNP-D instead treats the N reference utterances as a **context set** of input→output pairs: each pair `(content_ctx_i, mel_ctx_i)` is a direct observation of how the target speaker maps phonetic content to acoustic output at frame i. The ContextEncoder's Transformer attends over all these pairs jointly and outputs a full sequence `C [B, N·T_h, 256]` — a *function representation* rather than a fixed-size code. CrossAttentionFusion then uses the source content as a query against this function representation to predict the target speaker's mel for each source frame.
-
-This formulation is strictly more expressive: the model can exploit fine-grained co-variation between content and acoustics in the reference set, rather than averaging it into a single vector.
+TNP-D instead treats the N reference utterances as a **context set** of input→output pairs: each pair `(content_ctx_i, mel_ctx_i)` is a direct observation of how the target speaker maps phonetic content to acoustic output at frame i. The unified Transformer processes both context and target tokens jointly — context tokens attend over all reference frames to build a function representation, and each target token attends to the entire context while remaining conditionally independent of other target tokens. This is strictly more expressive than a fixed-size embedding: the model exploits fine-grained co-variation between content and acoustics in the reference set, not averaged into a single vector.
 
 ### Why ContentVec makes this work
 
@@ -447,7 +451,7 @@ Computing mel spectrograms on the CPU inside the DataLoader is the primary bottl
 
 ## Training — `train.py`
 
-Trains ContextEncoder, CrossAttentionFusion, and MelDecoder with bfloat16 AMP and gradient accumulation. ContentEncoder and Vocos remain frozen throughout.
+Trains `TNPUnifiedTransformer` with bfloat16 AMP and gradient accumulation. `ContentEncoder` and `VocosVocoder` remain frozen throughout.
 
 ```bash
 python train.py --reset                       # train from scratch (required: new architecture)
@@ -455,7 +459,7 @@ python train.py --data-root datasets/my_data  # custom dataset
 python train.py                               # resume from latest.pt
 ```
 
-> **Note:** Checkpoints from the previous VAE architecture are **incompatible** with the TNP-D model (`ContextEncoder.input_proj` changed from 256×100 to 256×869). Always use `--reset` when starting fresh after the architecture change.
+> **Note:** Checkpoints from any previous architecture are **incompatible** — the trainable module changed from three separate modules (`ContextEncoder`, `CrossAttentionFusion`, `MelDecoder`) to a single `TNPUnifiedTransformer`. Always use `--reset` when starting fresh.
 
 Checkpoints are written to `checkpoints/`:
 - `latest.pt` — every 1 000 steps, used for resuming
@@ -513,8 +517,8 @@ Every `SAVE_EVERY` steps, validation saves four WAV files to `checkpoints/sample
 Key constants at the top of `train.py`:
 
 ```python
-BATCH_SIZE    = 16       # physical batch per GPU step
-GRAD_ACCUM    = 4        # effective batch = BATCH_SIZE × GRAD_ACCUM = 64
+BATCH_SIZE    = 32       # physical batch per GPU step
+GRAD_ACCUM    = 2        # effective batch = BATCH_SIZE × GRAD_ACCUM = 64
 MAX_AUDIO_SEC = 8.0      # clip length — increase to use more VRAM
 MAX_STEPS     = 100_000
 LR            = 1e-4
@@ -689,16 +693,8 @@ To prevent the decoder from ignoring F0 inputs, it must receive the exact target
 
 For reference context encoding, `content_encoder(ctx_flat, f0_audio_16k=ctx_flat)` — F0 is extracted from the same clean reference audio, no shift applied.
 
-**Separate ContentVec / F0 projection in CrossAttentionFusion (Signal Drowning Fix)**
-The content vector fed to `CrossAttentionFusion` has shape `[B, T_frames, 769]` — 768 ContentVec channels followed by 1 log-F0 channel. A naïve single `nn.Linear(769, d_model)` projection applies the same Xavier initialisation variance (`~1/769`) to all 769 inputs. Because ContentVec contributes 768 columns while F0 contributes only 1, the total output variance driven by ContentVec is **768× larger** than the F0 signal at step 0 — the F0 is effectively drowned out, and the model converges to a blurry local minimum that ignores pitch entirely.
-
-To fix this, the projection is split into two independent heads:
-```python
-self.hubert_proj = nn.Linear(768, d_model)   # variance ∝ 1/768
-self.f0_proj     = nn.Linear(1,   d_model)   # variance ∝ 1/1  ← 768× larger weights
-Q = self.hubert_proj(content[..., :768]) + self.f0_proj(content[..., 768:])
-```
-The `f0_proj` fan-in of 1 means its weights are initialised ~28× larger in magnitude, amplifying the F0 signal to match the aggregate ContentVec signal power. The final expressible function is mathematically identical to a single `nn.Linear(769, d_model)` with manually set row-wise variances — but the split makes the initialisation automatic and PyTorch-idiomatic.
+**F0 signal in `tgt_proj` — fan-in initialisation keeps F0 visible**
+The target content vector `[B, T_hub, 769]` has 768 ContentVec channels and 1 log-F0 channel. `tgt_proj = nn.Linear(769, 512)` uses a single projection. Xavier uniform initialises weights with variance `∝ 1/769`; the aggregate ContentVec signal is 768× the F0 signal at step 0. In practice the 8-layer transformer gives the F0 dimension enough gradient path (via the mel reconstruction loss on voiced frames) to learn without the F0 being drowned out — but monitor early training for blurry pitch in `converted.wav` samples. If F0 remains flat, split `tgt_proj` into separate `hubert_proj = nn.Linear(768, 512)` and `f0_proj = nn.Linear(1, 512)` and add their outputs — `f0_proj` fan-in of 1 initialises weights ~28× larger and restores balance automatically.
 
 **F0 decoder — argmax, not Viterbi**
 `torchcrepe` is configured with `decoder=torchcrepe.decode.argmax`. Viterbi is a global dynamic-programming algorithm that requires the full sequence and is incompatible with chunk-by-chunk streaming. Argmax is frame-independent and causal.
@@ -706,10 +702,10 @@ The `f0_proj` fan-in of 1 means its weights are initialised ~28× larger in magn
 **F0 frame alignment**
 `torchcrepe.predict(..., hop_length=320)` and ContentVec both have a 320-sample stride, producing `T // 320` frames each. If you ever change one, change both — mismatched strides cause silent feature misalignment at concatenation.
 
-**Context encoder — deterministic TNP-D, no positional encoding, no mean pooling**
-Speaker identity (timbre, vocal tract shape) is time-invariant. Absolute positional encoding was removed so the model cannot overfit on the temporal position of phonemes in the reference clip. Mean pooling was also removed: `ContextEncoder` outputs a full sequence so `CrossAttentionFusion` can attend over all reference frames (TNP style).
+**TNPUnifiedTransformer — no positional encoding, strict conditional independence**
+No positional encoding is used. Speaker identity (timbre, vocal tract shape) is time-invariant, so position should not affect the mapping. Without PE, the model cannot overfit on the temporal position of phonemes in the reference clip.
 
-The input to `ContextEncoder` is a concatenated `(ContentVec+F0, mel)` pair of shape `[B, T_h, 869]`, where mel has been downsampled from 93.75 fps to ContentVec rate (50 fps) via `F.interpolate`. The `input_proj = nn.Linear(869, 256)` maps this to d_model. No variational bottleneck — the output `z` is fully deterministic, making both training and inference identical in behaviour.
+Context tokens are projected from `(ContentVec+F0, mel)` pairs `[B*N, T_h, 869]` via `ctx_proj = nn.Linear(869, 512)`. Target tokens are projected from `(ContentVec+F0)` `[B, T_hub, 769]` via `tgt_proj = nn.Linear(769, 512)`. After concatenation both pass through 8 shared Transformer layers (d=512, 8 heads, ff=2048). No variational bottleneck — the model is fully deterministic, training and inference behave identically.
 
 **ContentVec Instance Normalization**
 `F.instance_norm` is applied to ContentVec features `[B, 768, T_frames]` before the F0 concat. It normalises each `(sample, channel)` pair to mean=0 / std=1 across the time dimension, stripping any residual per-sample spectral bias. ContentVec's training objective already reduces speaker leakage; instance norm is a second hard constraint ensuring the content stream cannot bypass it.
@@ -720,20 +716,14 @@ The training loss is computed only over valid (non-padded) mel frames. `collate_
 **Batch padding and lengths**
 `collate_fn` zero-pads `source_audio` and `audio_content` to the batch maximum length. `source_lengths` and `content_lengths` are returned alongside the padded tensors so callers can recover the unpadded region. When saving validation audio samples, `source[0, :source_lengths[0]]` and `content_audio[0, :content_lengths[0]]` are used — feeding the full padded tensor (including zero-padding) into ContentVec causes garbage features for the silent tail, producing silence in the converted output after the real audio ends.
 
-**Two separate padding masks for context — self-attention and cross-attention**
-Context audios are zero-padded in two places: within `__getitem__` (clips within an item padded to the item-level maximum T) and in `collate_fn` (items padded to the batch-level maximum T). Padding must be excluded from *both* the context encoder's self-attention and the cross-attention fusion. These require masks of different shapes.
+**Padding masks in the unified Transformer**
+Context audios are zero-padded in `collate_fn` to the batch-level maximum. `model.forward()` builds a single float additive padding mask `[B, N*T_h + T_hub]` from `ctx_audio_lens` and `content_lengths`. Valid positions are 0; padded positions are -inf. This matches the dtype of the TNP-D attention mask so PyTorch's Transformer sees a consistent float mask throughout — no bool/float mismatch.
 
-`model.forward()` builds both masks internally from `ctx_audio_lens` (unpadded sample counts per reference):
 ```python
-# ctx_enc_mask:   [B*N, T_h]   — for ContextEncoder self-attention
-# ctx_cross_mask: [B, N*T_h]   — for CrossAttentionFusion key_padding_mask
-for i in range(B):
-    for n in range(N):
-        flen = min((ctx_audio_lens[i][n] // 320) + 1, T_h)
-        ctx_enc_mask[i * N + n, :flen]               = False
-        ctx_cross_mask[i, n * T_h : n * T_h + flen]  = False
+# ctx_key_padding_mask: [B, N*T_h]  True=padded (bool), built in model.forward()
+# pad_mask in TNPUnifiedTransformer.forward(): [B, N*T_h + T_hub]  float, 0/-inf
 ```
-At inference, `encode_references()` processes one utterance at a time — no padding, no mask needed.
+At inference, `compute_context()` processes one utterance at a time — no padding, no mask needed.
 
 **Vocos input format**
 The decoder outputs `[B, T_mel, 100]` (channels-last). Vocos expects `[B, 100, T_mel]` (channels-first). Always transpose before calling the vocoder: `vocoder(mel.transpose(1, 2))`.
@@ -760,12 +750,13 @@ ContentVec features must be normalised per-channel to strip residual speaker tim
 *Streaming* — `mic_convert.py` calls `model.convert_chunk()` with blocks of 15 ContentVec frames. `ContentEncoder.forward()` applies `F.instance_norm` over the full block sequence, which is short but stable enough at 15 frames for practical use. For sub-8-frame blocks, `instance_norm` would be noisy and the EMA `hubert_stats` path in `ContentEncoder.forward()` should be used instead.
 
 **TNP training / inference consistency**
-At inference `encode_references()` processes each reference audio through `compute_context()`, which calls ContentEncoder + mel + align + concat → ContextEncoder for each clip independently, then **concatenates** the N sequences along the time axis: `torch.cat(encoded, dim=1)` → `[1, N·T_h, 256]`. The training loop mirrors this exactly — context encoder output is reshaped, not averaged:
+At inference `compute_context()` calls ContentEncoder + mel + align + concat → `ctx_proj` for each reference clip independently, then **concatenates** along the time axis: `torch.cat(encoded_list, dim=1)` → `[1, N·T_h, 256]`. Training mirrors this exactly — `ctx_proj` output is reshaped, not averaged:
 ```python
-# model.forward() — context encoder output [B*N, T_h, d_model]
-C_all = self.context_encoder(ctx_pairs, src_key_padding_mask=ctx_enc_mask)
-C = C_all.view(B, N * T_h, -1)   # [B, N·T_h, d_model]  ← concatenate, not mean
+# model.forward()
+ctx_encoded = self.tnp.encode_context(ctx_pairs)  # [B*N, T_h, D_MODEL]
+ctx_encoded = ctx_encoded.view(B, N * T_h, -1)    # [B, N·T_h, D_MODEL] — concatenate, not mean
 ```
+Note that `ctx_proj` is just a linear projection; the actual self-attention across context tokens happens inside `TNPUnifiedTransformer.transformer` during the joint forward pass, not in a separate pre-encoding step.
 
 </details>
 
@@ -783,27 +774,28 @@ python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_
 python - <<'EOF'
 import torch
 from core.model import VoiceConversionModel
-from core.modules.context_encoder import ContextEncoder
+from core.modules.tnp_unified import TNPUnifiedTransformer
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 m = VoiceConversionModel(device)
+print("Trainable params:", m.trainable_param_count())   # 26,111,076
 
-# Deterministic context encoder: forward() returns a single Tensor
-enc = ContextEncoder().to(device).eval()
-ctx_pairs = torch.randn(2, 50, 869).to(device)   # [B, T_h, 769+100]
-z = enc(ctx_pairs)
-print("z shape:", z.shape)          # [2, 50, 256]
-assert isinstance(z, torch.Tensor), "expected Tensor, not tuple"
+# TNP-D mask correctness
+L_ctx, L_tgt = 80, 60
+mask = TNPUnifiedTransformer.build_tnp_mask(L_ctx, L_tgt, device)
+assert (mask[:L_ctx, L_ctx:] == float("-inf")).all(), "ctx must not see tgt"
+assert (mask[L_ctx:, :L_ctx] == 0).all(),            "tgt must see all ctx"
+assert (mask[L_ctx:, L_ctx:].diagonal() == 0).all(), "tgt diagonal must be open"
+print("TNP-D mask: OK")
 
-# Determinism check: same input → same output
-z2 = enc(ctx_pairs)
-print("Deterministic:", torch.allclose(z, z2))   # True
-
-# Full pipeline via pre-cached context
+# Determinism check
+m.eval()
 audio = torch.randn(1, 3200).to(device)
-C     = torch.randn(1, 750, 256).to(device)   # [1, T_ctx, D_MODEL]
-out   = m.convert_chunk(audio, C)
-print("Output shape:", out.shape)   # [1, 1, T_wav @ 24 kHz]
+C = m.compute_context([torch.randn(1, 12000).to(device)])
+out1 = m.convert_chunk(audio, C)
+out2 = m.convert_chunk(audio, C)
+print("Deterministic:", torch.allclose(out1, out2))     # True
+print("Output shape:", out1.shape)                      # [1, 1, T_wav @ 24 kHz]
 EOF
 
 # Dataset smoke test

@@ -14,7 +14,7 @@ Expected folder layout — one sub-folder per speaker, audio files inside:
     └── ...
 
 Supported audio formats: .wav  .flac  .mp3  .ogg
-Minimum utterances per speaker: N_CTX + 2  (default: 7)
+Minimum utterances per speaker: n_ctx + 1  (auto-derived from n_ctx)
 """
 
 import random
@@ -50,13 +50,15 @@ class SpeakerDataset(Dataset):
         root: str,
         split: str = "train",
         max_sec: float = 8.0,
-        n_ctx: int = 5,
-        min_utts: int = 7,
+        n_ctx: int = 2,
+        min_utts: int | None = None,
         val_ratio: float = 0.1,
         seed: int = 42,
     ) -> None:
         self.max_samples = int(max_sec * SAMPLE_RATE)
         self.n_ctx = n_ctx
+        if min_utts is None:
+            min_utts = n_ctx + 1  # 1 content clip + n_ctx context clips
 
         # Collect per-speaker file lists
         root_path = Path(root)

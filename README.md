@@ -142,12 +142,12 @@ SOURCE SPEAKER (augmented audio)
 
 | Module | Trainable | Parameters |
 |---|---|---|
-| ContextEncoder (Transformer, input 869→256) | Yes | ~3.2 M |
-| CrossAttentionFusion (hubert_proj + f0_proj + MHA + FFN) | Yes | ~1.0 M |
-| MelDecoder | Yes | ~2.6 M |
+| ContextEncoder (Transformer, input 869→256) | Yes | 3,382,272 |
+| CrossAttentionFusion (hubert_proj + f0_embed + MHA + FFN) | Yes | 1,118,208 |
+| MelDecoder | Yes | 2,591,076 |
 | ContentEncoder (DFN3 + ContentVec + crepe) | No | ~94 M |
 | VocosVocoder | No | ~13.4 M |
-| **Total trainable** | | **~6.8 M (~26 MB fp32)** |
+| **Total trainable** | | **7,091,556 (~27 MB fp32)** |
 
 **Temporal alignment:** ContentVec outputs at 50 fps (stride 320 @ 16 kHz). Mel is computed at ~93.75 fps (hop 256 @ 24 kHz). Reference mels are downsampled to ContentVec rate via `F.interpolate(mode='linear')` inside `model.forward()` before concatenation with content features.
 

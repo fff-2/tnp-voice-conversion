@@ -42,8 +42,8 @@ from dataset import SpeakerDataset, collate_fn
 
 SAMPLE_RATE = 16_000
 VOCODER_SR = 24_000  # mel computation and vocoder output sample rate
-BATCH_SIZE = 16  # physical batch per GPU step — increase to fill VRAM
-GRAD_ACCUM = 4  # effective batch = BATCH_SIZE * GRAD_ACCUM = 64
+BATCH_SIZE = 32  # physical batch per GPU step — increase to fill VRAM
+GRAD_ACCUM = 2  # effective batch = BATCH_SIZE * GRAD_ACCUM = 64
 MAX_STEPS = 100_000
 SAVE_EVERY = 1000
 LOG_EVERY = 50
@@ -52,7 +52,7 @@ WARMUP_STEPS = 1_000
 LR = 1e-4
 WEIGHT_DECAY = 1e-2
 MAX_AUDIO_SEC = 8.0  # longer clips → more HuBERT activations → more VRAM
-N_CTX = 2  # number of context utterances per training sample
+N_CTX = 1  # number of context utterances per training sample
 N_MELS = 100
 
 
@@ -108,8 +108,12 @@ def train(args) -> None:
         logger.info(f"Resumed from step {step}")
 
     # ── Dataset & DataLoader ──────────────────────────────────────────────────
-    train_ds = SpeakerDataset(args.data_root, split="train", max_sec=MAX_AUDIO_SEC, n_ctx=N_CTX)
-    val_ds = SpeakerDataset(args.data_root, split="val", max_sec=MAX_AUDIO_SEC, n_ctx=N_CTX)
+    train_ds = SpeakerDataset(
+        args.data_root, split="train", max_sec=MAX_AUDIO_SEC, n_ctx=N_CTX
+    )
+    val_ds = SpeakerDataset(
+        args.data_root, split="val", max_sec=MAX_AUDIO_SEC, n_ctx=N_CTX
+    )
     val_subset = torch.utils.data.Subset(val_ds, range(3, 53))
 
     train_loader = DataLoader(

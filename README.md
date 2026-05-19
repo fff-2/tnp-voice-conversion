@@ -565,7 +565,7 @@ Microphone  →  mic_queue  →  Inference thread  →  out_queue  →  Speaker
 | Stage | Time |
 |---|---|
 | Mic accumulation (`BLOCK` = 4 800 samples) | ~300 ms |
-| GPU inference (DFN3 + ContentVec + decode + vocoder) | ~25 ms |
+| GPU inference (`_denoise_streaming` + ContentVec + TNP + vocoder) | ~25 ms |
 | **Total steady-state** | **~325 ms** |
 
 Vocos outputs at 24 kHz; the inference thread resamples back to 16 kHz before writing to the output queue. Output is clipped to exactly `BLOCK` samples per iteration to prevent drift.
@@ -585,7 +585,7 @@ python convert.py --source me.wav --reference alice_1.wav alice_2.wav alice_3.wa
 **F0 shifting** is applied automatically: `convert.py` extracts F0 statistics from both the source audio and all reference files (concatenated), then maps the source speaker's pitch contour into the target speaker's fundamental frequency range. This is printed at runtime:
 
 ```
-F0 shifting: src=120.3±18.4 Hz → tgt=210.7±22.1 Hz
+F0 shifting: src=120.3Hz (±2.6 st) → tgt=210.7Hz (±1.7 st)
 ```
 
 If torchcrepe is not installed or either speaker has no voiced frames, F0 shifting is skipped silently and a message is printed instead.
@@ -600,7 +600,7 @@ If torchcrepe is not installed or either speaker has no voiced frames, F0 shifti
 | `--checkpoint` | `checkpoints/best.pt` | Trained model checkpoint |
 | `--output` | `converted.wav` | Output file path |
 
-Audio is processed in 4-second chunks. Long files are fully supported. Output is saved at 24 kHz (Vocos native sample rate).
+The full source audio is denoised by DFN3 in a single pass before chunking, so there is only one cold-start transient at the very start of the file rather than one per 4-second chunk. Output is saved at 24 kHz (Vocos native sample rate).
 
 </details>
 
@@ -656,11 +656,14 @@ DFN3 operates internally at 48 kHz. The content encoder resamples around it:
 Feeding 16 kHz directly into DFN3 produces silent garbage with no error.
 
 **DeepFilterNet3 GRU state**
-`reset_dfn_state()` must be called **once per audio session** — when a WebSocket connection opens or when `mic_convert.py` starts. Do not call it between chunks; the GRU hidden state carries temporal context across chunks.
+`enhance()` (the DeepFilterNet library function) calls `model.reset_h0()` at the **start of every call** — it is designed for offline enhancement of a complete audio file, not streaming. Calling `_denoise()` twice on consecutive chunks therefore cold-starts the GRU on the second chunk, causing ~0.5 s of attenuation at every call boundary.
 
-In streaming mode the DFN GRU must only advance over **new** audio. `mic_convert.py` calls `content_encoder._denoise()` on the raw non-overlapping chunk before prepending the denoised overlap for ContentVec context. Feeding the overlap prefix into DFN would process the same timeline twice, destroying the GRU state. The dedicated `VoiceConversionModel.convert_chunk_streaming()` method accepts pre-denoised audio and takes `skip_denoise=True` through to `ContentEncoder.forward()` so DFN is never called twice.
+Each call site is handled differently:
 
-`model.forward()` calls `reset_dfn_state(batch_size=B*N)` before encoding N reference utterances, then `reset_dfn_state(batch_size=B)` before encoding source audio. This ensures independent GRU state for each call.
+- **`convert.py` (offline):** the full source audio is passed to `_denoise()` in **one call** before the chunk loop. DFN3 has a single cold start at the beginning; all 4-second chunks are sliced from the pre-denoised tensor. `convert_chunk_streaming()` (which accepts pre-denoised audio via `skip_denoise=True`) is used instead of `convert_chunk()`.
+- **`compute_context()` (reference encoding):** each reference waveform is denoised in **one** `_denoise()` call, then forwarded with `skip_denoise=True` so no second `enhance()` call is made.
+- **`mic_convert.py` (real-time):** `_denoise_streaming()` suppresses the internal `reset_h0` inside `enhance()`, allowing the GRU state to carry over across blocks. `reset_dfn_state()` is called **once** at stream start. `convert_chunk_streaming()` receives the pre-denoised block.
+- **Training `model.forward()`:** skips DFN3 entirely (`skip_denoise=True`) — training data is clean studio audio, so denoising adds no benefit and the cold-start transient would only corrupt the training signal. DFN3 is active only at inference, where the input may be a live microphone. Since DFN3's goal is to make noisy audio look like clean audio before ContentVec, the train/inference distribution mismatch is minimal.
 
 **ContentVec layer**
 `HubertModel.from_pretrained("lengyue233/content-vec-best")` returns a standard `transformers` HuBERT model. `last_hidden_state` (the final transformer layer) is used — ContentVec is trained to maximise speaker disentanglement at the last layer, unlike speech HuBERT where layer 6 is preferred. Weights (~360 MB) are downloaded to `~/.cache/huggingface/` on first run.
@@ -676,15 +679,19 @@ Raw F0 from torchcrepe spans `[0, 800]` Hz (fmax=800) while ContentVec features 
 
 A nanmedian spike filter (kernel size 5) is applied after periodicity gating. Unvoiced frames are marked NaN before the median window so they cannot pull voiced pitch values down at voiced/silence boundaries — nanmedian returns a non-NaN value as long as at least one frame in the window is voiced.
 
-`ContentEncoder.forward()` accepts an optional `f0_stats=(src_mean, src_std, tgt_mean, tgt_std)` tuple. When provided, voiced frames (f0 > 0) are Z-score shifted before `log1p`:
+`ContentEncoder.forward()` accepts an optional `f0_stats=(src_log_mean, src_log_std, tgt_log_mean, tgt_log_std)` tuple (all values in log(Hz)). When provided, voiced frames (f0 > 0) are Z-score shifted in log domain before `log1p`:
 ```python
 voiced_mask = (f0 > 0.0).float()
-f0_shifted = (f0 - src_mean) / (src_std + 1e-5) * tgt_std + tgt_mean
-f0 = voiced_mask * f0_shifted.clamp(min=50.0) + (1.0 - voiced_mask) * f0
+log_f0 = torch.log(f0.clamp(min=1.0))          # log(Hz); unvoiced→0, masked out
+log_f0_shifted = (log_f0 - src_log_mean) / (src_log_std + 1e-5) * tgt_log_std + tgt_log_mean
+f0_shifted = torch.exp(log_f0_shifted).clamp(min=50.0, max=800.0)
+f0 = voiced_mask * f0_shifted + (1.0 - voiced_mask) * f0
 ```
 Unvoiced frames (f0 == 0) are left unchanged. This shifts the source speaker's pitch contour into the target speaker's fundamental frequency range — without it, a male-to-female conversion will have the correct timbre but the wrong pitch register.
 
-F0 statistics (center, spread) are estimated with **robust estimators** — median + MAD×1.4826 — instead of mean + std. Raw standard deviation is inflated by octave-error frames (torchcrepe occasionally returns a frame at twice the true fundamental); MAD is insensitive to these outliers and gives a spread estimate consistent with the actual pitch augmentation ratio.
+F0 statistics are computed and applied in **log(Hz) domain**. Log-domain Z-score shift is equivalent to a multiplicative (ratio-preserving) transformation in Hz, so semitone intervals and vibrato depth are exactly preserved. A linear Z-score shift in Hz would distort interval ratios — e.g. a perfect fifth (3:2 ratio) would be compressed or expanded depending on absolute pitch.
+
+Statistics use **robust estimators** (median + MAD×1.4826) in log(Hz), resisting octave-error outliers. `extract_f0_stats` returns `(log_center, log_spread)`; the shift in `ContentEncoder.forward()` converts to log, applies Z-score, then exponentiates back to Hz before `log1p`.
 
 `f0_stats` is used in three places:
 - **`convert.py`** — extracted from source and concatenated reference audio once before the chunk loop; applied to every chunk.
@@ -752,7 +759,7 @@ ContentVec features must be normalised per-channel to strip residual speaker tim
 
 *Training* — `F.instance_norm` over the full sequence: normalises each `(sample, channel)` pair across all T frames, giving mean=0 / std=1 per channel. Stable because sequences are 100–400 frames long.
 
-*Streaming* — `mic_convert.py` calls `model.convert_chunk()` with blocks of 15 ContentVec frames. `ContentEncoder.forward()` applies `F.instance_norm` over the full block sequence, which is short but stable enough at 15 frames for practical use. For sub-8-frame blocks, `instance_norm` would be noisy and the EMA `hubert_stats` path in `ContentEncoder.forward()` should be used instead.
+*Streaming* — `mic_convert.py` pre-denoises each block with `_denoise_streaming()` then calls `model.convert_chunk_streaming()` with blocks of 15 ContentVec frames. `ContentEncoder.forward()` applies `F.instance_norm` over the full block sequence, which is short but stable enough at 15 frames for practical use. For sub-8-frame blocks, `instance_norm` would be noisy and the EMA `hubert_stats` path in `ContentEncoder.forward()` should be used instead.
 
 **TNP training / inference consistency**
 At inference `compute_context()` calls ContentEncoder + mel + align + concat → `ctx_proj` for each reference clip independently, then **concatenates** along the time axis: `torch.cat(encoded_list, dim=1)` → `[1, N·T_h, 256]`. Training mirrors this exactly — `ctx_proj` output is reshaped, not averaged:

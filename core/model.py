@@ -115,10 +115,13 @@ class VoiceConversionModel(nn.Module):
         ctx_flat = context_audios.view(B * N, T_ctx)
 
         # ── Reference features (frozen, no grad) ─────────────────────────────
-        self.content_encoder.reset_dfn_state(batch_size=B * N)
+        # skip_denoise=True: training data is clean studio audio; DFN3 cold-start
+        # on clean audio only adds noise to the training signal with no benefit.
+        # DFN3 is still used at inference (convert.py / mic_convert.py) where the
+        # input may be noisy, preceded by a 1-s silence warm-up.
         with torch.no_grad():
             ctx_content = self.content_encoder(
-                ctx_flat, f0_audio_16k=ctx_flat
+                ctx_flat, f0_audio_16k=ctx_flat, skip_denoise=True
             )  # [B*N, T_h, 769]
             ctx_mel_cf = self._compute_mel_channels_first(ctx_flat)
             #                                            [B*N, N_MELS, T_mel]
@@ -146,12 +149,12 @@ class VoiceConversionModel(nn.Module):
             ctx_key_padding_mask.fill_(False)
 
         # ── Source content (frozen, no grad) ─────────────────────────────────
-        self.content_encoder.reset_dfn_state(batch_size=B)
         with torch.no_grad():
             content = self.content_encoder(
                 source_audio,
                 f0_audio_16k=target_audio,
                 lengths=content_lengths,
+                skip_denoise=True,
             )  # [B, T_frames, 769]
 
         # ── Unified TNP-D transformer ─────────────────────────────────────────
@@ -181,9 +184,12 @@ class VoiceConversionModel(nn.Module):
         self.eval()
         encoded_list = []
         for wav in reference_audios:
-            self.content_encoder.reset_dfn_state(batch_size=1)
-            content = self.content_encoder(wav, f0_audio_16k=wav)  # [1, T_h, 769]
-            mel_cf = self._compute_mel_channels_first(wav)  # [1, N_MELS, T_mel]
+            # enhance() resets the GRU at the start of every call, so a separate
+            # warm-up call followed by a content call would cold-start twice.
+            # Denoise in one pass; forward with skip_denoise=True avoids a second reset.
+            denoised = self.content_encoder._denoise(wav)               # one enhance() call
+            content = self.content_encoder(denoised, skip_denoise=True)  # [1, T_h, 769]
+            mel_cf = self._compute_mel_channels_first(denoised)         # [1, N_MELS, T_mel]
             T_h = content.shape[1]
             mel_al = self._align_mel_to_content_rate(mel_cf, T_h)  # [1, T_h, N_MELS]
             pair = torch.cat([content, mel_al], dim=-1)  # [1, T_h, 869]
@@ -271,10 +277,12 @@ class VoiceConversionModel(nn.Module):
             hubert_norm = F.instance_norm(hubert_feat.transpose(1, 2)).transpose(1, 2)
 
         if f0_stats is not None:
-            src_mean, src_std, tgt_mean, tgt_std = f0_stats
+            src_log_mean, src_log_std, tgt_log_mean, tgt_log_std = f0_stats
             voiced_mask = (f0 > 0.0).float()
-            f0_shifted = (f0 - src_mean) / (src_std + 1e-5) * tgt_std + tgt_mean
-            f0 = voiced_mask * f0_shifted.clamp(min=50.0) + (1.0 - voiced_mask) * f0
+            log_f0 = torch.log(f0.clamp(min=1.0))
+            log_f0_shifted = (log_f0 - src_log_mean) / (src_log_std + 1e-5) * tgt_log_std + tgt_log_mean
+            f0_shifted = torch.exp(log_f0_shifted).clamp(min=50.0, max=800.0)
+            f0 = voiced_mask * f0_shifted + (1.0 - voiced_mask) * f0
 
         f0 = torch.log1p(f0)
         content = torch.cat([hubert_norm, f0], dim=-1)  # [1, T, 769]

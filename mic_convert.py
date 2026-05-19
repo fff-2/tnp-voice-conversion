@@ -144,15 +144,12 @@ class RealtimeConverter:
     """
     Streaming voice conversion — simplified.
 
-    Uses model.convert_chunk() directly (same code path as convert.py).
-    No ring buffer, no EMA, no separate feature extraction.
-    DFN GRU state is maintained automatically across blocks.
-
     Per-block pipeline:
-      1. convert_chunk(block, C, f0_stats)  — full pipeline in one call
-      2. Resample 24 kHz → 16 kHz
-      3. Linear crossfade at boundaries
-      4. Write to output
+      1. _denoise_streaming(block)          — DFN3 with GRU state preserved across blocks
+      2. convert_chunk_streaming(denoised)  — ContentVec + F0 + TNP + Vocos
+      3. Resample 24 kHz → 16 kHz
+      4. Linear crossfade at boundaries
+      5. Write to output
     """
 
     def __init__(
@@ -234,7 +231,7 @@ class RealtimeConverter:
                 self._src_f0_std  = (1 - α) * self._src_f0_std  + α * cs
 
     def _process_block(self, block: np.ndarray) -> np.ndarray:
-        """Process one BLOCK of audio through model.convert_chunk() — same as convert.py."""
+        """Process one BLOCK of audio through the streaming pipeline."""
         t0 = time.time()
 
         audio_t = torch.from_numpy(block).unsqueeze(0).to(self.dev)
@@ -242,8 +239,11 @@ class RealtimeConverter:
         self._update_src_f0(audio_t)
         f0_stats = self._get_f0_stats()
 
-        # Run the exact same pipeline as convert.py
-        wav = self.model.convert_chunk(audio_t, self.C, f0_stats=f0_stats)
+        # _denoise_streaming() preserves GRU state across blocks (no reset_h0 per block).
+        # convert_chunk_streaming() accepts pre-denoised audio (skip_denoise=True).
+        with torch.no_grad():
+            denoised = self.model.content_encoder._denoise_streaming(audio_t)
+        wav = self.model.convert_chunk_streaming(denoised, self.C, f0_stats=f0_stats)
         t_infer = time.time()
 
         # Resample 24 kHz → 16 kHz

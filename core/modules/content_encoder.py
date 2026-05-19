@@ -82,6 +82,9 @@ class ContentEncoder(nn.Module):
         """
         Denoise audio using DeepFilterNet3.
 
+        NOTE: enhance() resets the DFN3 GRU at the start of every call.
+        Use _denoise_streaming() when GRU state must be preserved across calls.
+
         Args:
             audio_16k: [B, T]  mono 16 kHz float32
         Returns:
@@ -91,18 +94,31 @@ class ContentEncoder(nn.Module):
             return audio_16k  # passthrough if DFN not installed
 
         B, T = audio_16k.shape
-        # Resample 16k → 48k for DFN
         audio_48k = AF.resample(audio_16k, self.SR_HUB, self.SR_DFN)  # [B, T*3]
-        # enhance() expects [B, T] float32
         enhanced_48k = enhance(self.dfn_model, self.dfn_state, audio_48k)  # [B, T*3]
-        # Resample 48k → 16k
         denoised = AF.resample(enhanced_48k, self.SR_DFN, self.SR_HUB)  # [B, T]
-        # Ensure exact length (resampling may add/remove 1 sample due to rounding)
         if denoised.shape[-1] > T:
             denoised = denoised[..., :T]
         elif denoised.shape[-1] < T:
             denoised = torch.nn.functional.pad(denoised, (0, T - denoised.shape[-1]))
         return denoised
+
+    def _denoise_streaming(self, audio_16k: Tensor) -> Tensor:
+        """
+        Streaming-safe denoise: GRU state is preserved across calls.
+
+        Temporarily suppresses enhance()'s internal reset_h0 so the GRU
+        carries over from the previous block. Call reset_dfn_state() once
+        at stream start to initialise, then call this per block.
+        """
+        if self.dfn_model is None:
+            return audio_16k
+        _orig_reset = self.dfn_model.reset_h0
+        self.dfn_model.reset_h0 = lambda **kwargs: None  # suppress per-call reset
+        try:
+            return self._denoise(audio_16k)
+        finally:
+            self.dfn_model.reset_h0 = _orig_reset
 
     @torch.no_grad()
     def _extract_contentvec(self, audio_16k: Tensor) -> Tensor:
@@ -207,10 +223,9 @@ class ContentEncoder(nn.Module):
 
         # Step 3: F0
         if f0_audio_16k is not None:
-            if not skip_denoise:
-                self.reset_dfn_state(batch_size=f0_audio_16k.shape[0])
-            f0_audio = f0_audio_16k if skip_denoise else self._denoise(f0_audio_16k)
-            f0 = self._extract_f0(f0_audio)
+            # Caller always provides clean/pre-denoised audio when passing f0_audio_16k.
+            # Denoising it separately would trigger a second enhance() GRU reset.
+            f0 = self._extract_f0(f0_audio_16k)
         else:
             f0 = self._extract_f0(audio)  # [B, T_frames, 1]
 
@@ -259,16 +274,19 @@ class ContentEncoder(nn.Module):
 
         # Step 5: F0 speaker normalisation then log-scale.
         # Training: no shift — source and target are the same utterance (self-reconstruction).
-        # Streaming: Z-score shift maps source speaker's pitch range to target's range,
-        #   essential when source and target speakers have different fundamental frequencies
-        #   (e.g. male → female conversion).  Unvoiced frames (f0 == 0) are left unchanged.
+        # Streaming: log-domain Z-score shift maps source speaker's pitch range to target's range.
+        #   Operates in log(Hz) so musical intervals (semitone ratios) are preserved exactly.
+        #   Unvoiced frames (f0 == 0) are left unchanged.
         if f0_stats is not None:
-            src_mean, src_std, tgt_mean, tgt_std = f0_stats
+            src_log_mean, src_log_std, tgt_log_mean, tgt_log_std = f0_stats
             voiced_mask = (f0 > 0.0).float()
-            f0_shifted = (f0 - src_mean) / (src_std + 1e-5) * tgt_std + tgt_mean
-            f0 = voiced_mask * f0_shifted.clamp(min=50.0) + (1.0 - voiced_mask) * f0
+            # log of voiced frames; clamp to 1.0 for unvoiced (log→0, masked out anyway)
+            log_f0 = torch.log(f0.clamp(min=1.0))
+            log_f0_shifted = (log_f0 - src_log_mean) / (src_log_std + 1e-5) * tgt_log_std + tgt_log_mean
+            f0_shifted = torch.exp(log_f0_shifted).clamp(min=50.0, max=800.0)
+            f0 = voiced_mask * f0_shifted + (1.0 - voiced_mask) * f0
 
-        f0 = torch.log1p(f0)  # [0, 2006] Hz → [0, ~7.6]
+        f0 = torch.log1p(f0)  # [0, 800] Hz → [0, ~6.7]
         content = torch.cat([hubert_norm, f0], dim=-1)  # [B, T_frames, 769]
         return content
 

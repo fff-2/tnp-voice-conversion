@@ -326,14 +326,15 @@ def _validate(
                 src_v = src_v[src_v > 0.0]
                 tgt_v = tgt_v[tgt_v > 0.0]
                 if len(src_v) > 1 and len(tgt_v) > 1:
-                    # Robust estimators: median + MAD-based std
-                    # Prevents residual octave errors from inflating the spread.
-                    def _robust(v):
-                        c = float(np.median(v))
-                        s = float(max(np.median(np.abs(v - c)) * 1.4826, 5.0))
+                    # Log-domain robust stats: median + MAD×1.4826 in log(Hz).
+                    # Preserves semitone intervals; resists octave-error outliers.
+                    def _robust_log(v):
+                        lv = np.log(v)
+                        c = float(np.median(lv))
+                        s = float(max(np.median(np.abs(lv - c)) * 1.4826, 0.05))
                         return c, s
-                    sc, ss = _robust(src_v)
-                    tc, ts = _robust(tgt_v)
+                    sc, ss = _robust_log(src_v)
+                    tc, ts = _robust_log(tgt_v)
                     sample_f0_stats = (sc, ss, tc, ts)
 
             # Converted: source content + target speaker context → vocoder
@@ -348,10 +349,9 @@ def _validate(
                 ]
                 C_sample = model.compute_context(ref_list)  # [1, T_total, D_MODEL]
 
-                model.content_encoder.reset_dfn_state(batch_size=1)
-                wav = model.convert_chunk(
-                    source[0:1, :src_len], C_sample, f0_stats=sample_f0_stats
-                )
+                with torch.no_grad():
+                    denoised_src = model.content_encoder._denoise(source[0:1, :src_len])
+                wav = model.convert_chunk_streaming(denoised_src, C_sample, f0_stats=sample_f0_stats)
             sf.write(
                 str(sample_dir / "converted.wav"),
                 wav[0, 0, :].cpu().numpy(),

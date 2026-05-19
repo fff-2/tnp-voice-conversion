@@ -48,10 +48,12 @@ def load_audio(path: str, device: torch.device) -> torch.Tensor:
 
 def extract_f0_stats(audio: torch.Tensor, model) -> tuple | None:
     """
-    Return (center_hz, spread_hz) of voiced F0 using robust estimators.
+    Return (log_center, log_spread) of voiced F0 in log(Hz) domain.
 
-    Uses median + MAD-based std (×1.4826) instead of mean + std so that
-    residual octave-error frames do not inflate the spread estimate.
+    Log-domain statistics preserve musical intervals: a Z-score shift in
+    log(Hz) is equivalent to a multiplicative (ratio-preserving) shift in Hz,
+    keeping semitone intervals and vibrato depth intact.
+    Robust estimators (median + MAD×1.4826) resist octave-error outliers.
     """
     if not model.content_encoder._crepe_available:
         return None
@@ -61,9 +63,10 @@ def extract_f0_stats(audio: torch.Tensor, model) -> tuple | None:
     voiced = f0_np[f0_np > 0.0]
     if len(voiced) < 2:
         return None
-    center = float(np.median(voiced))
-    spread = float(max(np.median(np.abs(voiced - center)) * 1.4826, 5.0))
-    return center, spread
+    log_voiced = np.log(voiced)
+    log_center = float(np.median(log_voiced))
+    log_spread = float(max(np.median(np.abs(log_voiced - log_center)) * 1.4826, 0.05))
+    return log_center, log_spread
 
 
 def convert(args) -> None:
@@ -105,26 +108,32 @@ def convert(args) -> None:
     f0_stats = None
     if src_f0 and tgt_f0:
         f0_stats = (src_f0[0], src_f0[1], tgt_f0[0], tgt_f0[1])
-        print(f"F0 shifting: src={src_f0[0]:.1f}±{src_f0[1]:.1f} Hz → tgt={tgt_f0[0]:.1f}±{tgt_f0[1]:.1f} Hz")
+        _st = np.log(2) / 12  # natural-log width of one semitone
+        print(f"F0 shifting: src={np.exp(src_f0[0]):.1f}Hz (±{src_f0[1]/_st:.1f} st) → tgt={np.exp(tgt_f0[0]):.1f}Hz (±{tgt_f0[1]/_st:.1f} st)")
     else:
         print("F0 shifting disabled (torchcrepe unavailable or no voiced frames)")
 
-    # Reset DFN state once for the full conversion pass
-    model.content_encoder.reset_dfn_state(batch_size=1)
+    # Pre-denoise full source in one enhance() pass.
+    # enhance() resets the DFN3 GRU at the start of every call, so a separate
+    # warm-up call followed by per-chunk calls would cold-start on every chunk.
+    # One call processes the full audio continuously with a single cold start.
+    print("Denoising source audio...")
+    with torch.no_grad():
+        denoised_source = model.content_encoder._denoise(source)   # [1, T_total]
 
     # ── Process in chunks ─────────────────────────────────────────────────────
     output_chunks = []
     step = CHUNK_SAMPLES
     for start in range(0, T_total, step):
         end = min(start + step, T_total)
-        chunk = source[:, start:end]               # [1, chunk_len]
+        chunk = denoised_source[:, start:end]      # [1, chunk_len]
 
         # Pad last chunk if shorter than expected (HuBERT needs ≥ 1 frame)
         if chunk.shape[-1] < 400:
             print(f"Skipping final {chunk.shape[-1]}-sample chunk (too short).")
             break
 
-        wav_out = model.convert_chunk(chunk, C, f0_stats=f0_stats)    # [1, 1, T_out]
+        wav_out = model.convert_chunk_streaming(chunk, C, f0_stats=f0_stats)  # [1, 1, T_out]
         output_chunks.append(wav_out.squeeze(0))   # [1, T_out]
 
         pct = min(end, T_total) / T_total * 100

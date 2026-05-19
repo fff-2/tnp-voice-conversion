@@ -24,7 +24,6 @@ Usage:
 """
 
 import argparse
-import math
 import random
 import tempfile
 from pathlib import Path
@@ -168,7 +167,6 @@ def run_mel_cache(
     mel_transform = torchaudio.transforms.MelSpectrogram(
         sample_rate=MEL_SR, n_fft=N_FFT, hop_length=HOP, win_length=WIN, n_mels=N_MELS, power=1.0, center=True,
     ).to(device)
-    resampler = None
 
     with torch.no_grad():
         for padded, lengths, native_sr, paths in tqdm(loader, desc="Mel cache", unit="batch"):

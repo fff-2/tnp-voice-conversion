@@ -46,7 +46,7 @@ VOCODER_SR = 24_000  # mel computation and vocoder output sample rate
 BATCH_SIZE = 32  # physical batch per GPU step — increase to fill VRAM
 GRAD_ACCUM = 2  # effective batch = BATCH_SIZE * GRAD_ACCUM = 64
 MAX_STEPS = 100_000
-SAVE_EVERY = 1000
+SAVE_EVERY = 2500
 LOG_EVERY = 50
 CSV_LOG_EVERY = 50
 WARMUP_STEPS = 1_000
@@ -321,17 +321,20 @@ def _validate(
                     tgt_f0 = model.content_encoder._extract_f0(
                         content_audio[0:1, :tgt_len]
                     )
-                src_voiced = src_f0[0, :, 0].cpu().numpy()
-                tgt_voiced = tgt_f0[0, :, 0].cpu().numpy()
-                src_v = src_voiced[src_voiced > 0.0]
-                tgt_v = tgt_voiced[tgt_voiced > 0.0]
+                src_v = src_f0[0, :, 0].cpu().numpy()
+                tgt_v = tgt_f0[0, :, 0].cpu().numpy()
+                src_v = src_v[src_v > 0.0]
+                tgt_v = tgt_v[tgt_v > 0.0]
                 if len(src_v) > 1 and len(tgt_v) > 1:
-                    sample_f0_stats = (
-                        float(src_v.mean()),
-                        float(max(src_v.std(), 5.0)),
-                        float(tgt_v.mean()),
-                        float(max(tgt_v.std(), 5.0)),
-                    )
+                    # Robust estimators: median + MAD-based std
+                    # Prevents residual octave errors from inflating the spread.
+                    def _robust(v):
+                        c = float(np.median(v))
+                        s = float(max(np.median(np.abs(v - c)) * 1.4826, 5.0))
+                        return c, s
+                    sc, ss = _robust(src_v)
+                    tc, ts = _robust(tgt_v)
+                    sample_f0_stats = (sc, ss, tc, ts)
 
             # Converted: source content + target speaker context → vocoder
             with torch.amp.autocast(

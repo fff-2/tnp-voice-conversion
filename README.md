@@ -108,7 +108,7 @@ SOURCE SPEAKER (augmented audio)                                            │
         ▼                                                                   │
 ContentEncoder (frozen)                                                     │
 [B, T @ 16 kHz] → content [B, T_hub, 769]                                  │
-        │  tgt_proj                                                         │
+        │  hubert_proj(768→512) + f0_proj(1→512)                            │
         ▼                                                                   │
   [B, T_hub, 512]  ─────────────────────────────────────────────────────►  │
                                                                             ▼
@@ -145,12 +145,13 @@ ContentEncoder (frozen)                                                     │
 | Module | Trainable | Parameters |
 |---|---|---|
 | ctx_proj  Linear(869 → 512) | Yes | 445,440 |
-| tgt_proj  Linear(769 → 512) | Yes | 394,240 |
+| hubert_proj  Linear(768 → 512) | Yes | 393,728 |
+| f0_proj  Linear(1 → 512) | Yes | 1,024 |
 | Transformer × 8 layers (d=512, heads=8, ff=2048) | Yes | 25,219,072 |
 | out_norm + mel_proj  Linear(512 → 100) | Yes | 52,324 |
 | ContentEncoder (DFN3 + ContentVec + crepe) | No | ~94.4 M |
 | VocosVocoder | No | ~13.5 M |
-| **Total trainable** | | **26,111,076 (~99.6 MB fp32)** |
+| **Total trainable** | | **26,111,588 (~99.6 MB fp32)** |
 
 **Temporal alignment:** ContentVec outputs at 50 fps (stride 320 @ 16 kHz). Mel is computed at ~93.75 fps (hop 256 @ 24 kHz). Reference mels are downsampled to ContentVec rate via `F.interpolate(mode='linear')` before concatenation. After the transformer, target features are upsampled back to mel rate (`scale_factor = 1.875`) inside `TNPUnifiedTransformer` before `mel_proj`.
 
@@ -187,7 +188,7 @@ source_audio   ──→ ContentEncoder (ContentVec+InstanceNorm)  ──→  [B
 audio_content  ──→ ContentEncoder (Crepe F0)  ──→  F0 appended to ContentVec
   (clean)
 
-                    tgt_proj → [B, T_hub, 512]
+                    hubert_proj + f0_proj → [B, T_hub, 512]
 
 ──────── cat(dim=1) ─────────────────────────────────────────────────────
 [B, N·T_h + T_hub, 512]
@@ -341,7 +342,7 @@ python train.py --data-root datasets/jvs_music_ver1   # or combine with VCTK via
 
 `prepare_jvs_music.py` produces **1,006 segments** (2–8 s each, 24 kHz) across 100 speakers. The 24 kHz native sample rate is preserved end-to-end by Phase 2 of `preprocess.py`, so no quality is lost compared with the downsampled 16 kHz → 24 kHz path used for VCTK. Since ContentVec and torchcrepe operate at 16 kHz, `dataset.py` resamples on load — no changes to the data pipeline are needed.
 
-> **Why singing data matters:** The model's torchcrepe F0 extractor covers `[50, 1100]` Hz to include the soprano singing range (~1100 Hz). Training on JVS-MuSiC teaches the ContextEncoder to encode a singer's vocal tract shape and register from sung context clips, enabling cross-speaker singing voice conversion alongside speech conversion.
+> **Why singing data matters:** The model's torchcrepe F0 extractor covers `[50, 800]` Hz, spanning speech and light singing registers. Training on JVS-MuSiC teaches the ContextEncoder to encode a singer's vocal tract shape and register from sung context clips, enabling cross-speaker singing voice conversion alongside speech conversion.
 
 **Option D — Custom recordings**
 
@@ -462,7 +463,7 @@ python train.py                               # resume from latest.pt
 > **Note:** Checkpoints from any previous architecture are **incompatible** — the trainable module changed from three separate modules (`ContextEncoder`, `CrossAttentionFusion`, `MelDecoder`) to a single `TNPUnifiedTransformer`. Always use `--reset` when starting fresh.
 
 Checkpoints are written to `checkpoints/`:
-- `latest.pt` — every 1 000 steps, used for resuming
+- `latest.pt` — every 2 500 steps, used for resuming
 - `best.pt` — whenever validation loss improves, used for inference
 
 ### Training log CSV
@@ -523,7 +524,7 @@ MAX_AUDIO_SEC = 8.0      # clip length — increase to use more VRAM
 MAX_STEPS     = 100_000
 LR            = 1e-4
 WARMUP_STEPS  = 1_000
-SAVE_EVERY    = 1_000    # validation + checkpoint + audio sample interval
+SAVE_EVERY    = 2_500    # validation + checkpoint + audio sample interval
 ```
 
 </details>
@@ -671,15 +672,19 @@ In streaming mode the DFN GRU must only advance over **new** audio. `mic_convert
 `preprocess.py` Phase 1 generates `<stem>_aug.pt` — a 16-kHz audio tensor produced by Praat's *Change gender* algorithm with randomised pitch and formant ratios. Pitch direction (up or down) and formant direction are sampled independently so the combination covers a wide range of voice characteristics. The augmented tensor is stored once and loaded by `dataset.py` at training time, avoiding the cost of running Parselmouth or `torchaudio.functional.pitch_shift` inside the training loop. If `_aug.pt` is missing for a given file, `_load_aug()` silently falls back to clean audio.
 
 **F0 log scaling and cross-speaker Z-score shift**
-Raw F0 from torchcrepe spans `[0, 1100]` Hz (fmax=1100 to cover singing soprano range) while ContentVec features fall roughly in `[-3, +3]`. `torch.log1p(f0)` maps F0 to `[0, ~7.6]` before it is passed to `f0_proj`.
+Raw F0 from torchcrepe spans `[0, 800]` Hz (fmax=800) while ContentVec features fall roughly in `[-3, +3]`. `torch.log1p(f0)` maps F0 to `[0, ~6.7]` before it is passed to `f0_proj`.
+
+A nanmedian spike filter (kernel size 5) is applied after periodicity gating. Unvoiced frames are marked NaN before the median window so they cannot pull voiced pitch values down at voiced/silence boundaries — nanmedian returns a non-NaN value as long as at least one frame in the window is voiced.
 
 `ContentEncoder.forward()` accepts an optional `f0_stats=(src_mean, src_std, tgt_mean, tgt_std)` tuple. When provided, voiced frames (f0 > 0) are Z-score shifted before `log1p`:
 ```python
 voiced_mask = (f0 > 0.0).float()
 f0_shifted = (f0 - src_mean) / (src_std + 1e-5) * tgt_std + tgt_mean
-f0 = voiced_mask * f0_shifted.clamp(min=0.0) + (1.0 - voiced_mask) * f0
+f0 = voiced_mask * f0_shifted.clamp(min=50.0) + (1.0 - voiced_mask) * f0
 ```
 Unvoiced frames (f0 == 0) are left unchanged. This shifts the source speaker's pitch contour into the target speaker's fundamental frequency range — without it, a male-to-female conversion will have the correct timbre but the wrong pitch register.
+
+F0 statistics (center, spread) are estimated with **robust estimators** — median + MAD×1.4826 — instead of mean + std. Raw standard deviation is inflated by octave-error frames (torchcrepe occasionally returns a frame at twice the true fundamental); MAD is insensitive to these outliers and gives a spread estimate consistent with the actual pitch augmentation ratio.
 
 `f0_stats` is used in three places:
 - **`convert.py`** — extracted from source and concatenated reference audio once before the chunk loop; applied to every chunk.
@@ -693,8 +698,8 @@ To prevent the decoder from ignoring F0 inputs, it must receive the exact target
 
 For reference context encoding, `content_encoder(ctx_flat, f0_audio_16k=ctx_flat)` — F0 is extracted from the same clean reference audio, no shift applied.
 
-**F0 signal in `tgt_proj` — fan-in initialisation keeps F0 visible**
-The target content vector `[B, T_hub, 769]` has 768 ContentVec channels and 1 log-F0 channel. `tgt_proj = nn.Linear(769, 512)` uses a single projection. Xavier uniform initialises weights with variance `∝ 1/769`; the aggregate ContentVec signal is 768× the F0 signal at step 0. In practice the 8-layer transformer gives the F0 dimension enough gradient path (via the mel reconstruction loss on voiced frames) to learn without the F0 being drowned out — but monitor early training for blurry pitch in `converted.wav` samples. If F0 remains flat, split `tgt_proj` into separate `hubert_proj = nn.Linear(768, 512)` and `f0_proj = nn.Linear(1, 512)` and add their outputs — `f0_proj` fan-in of 1 initialises weights ~28× larger and restores balance automatically.
+**Split projection keeps F0 visible — `hubert_proj` + `f0_proj`**
+The target content vector `[B, T_hub, 769]` has 768 ContentVec channels and 1 log-F0 channel. A single `nn.Linear(769, 512)` would initialise with Xavier uniform variance `∝ 1/769`; the aggregate ContentVec signal would be 768× the F0 signal at step 0, making it easy for the model to ignore pitch entirely in early training. Instead two separate projections are used: `hubert_proj = nn.Linear(768, 512)` for ContentVec and `f0_proj = nn.Linear(1, 512)` for log-F0, added element-wise. Xavier uniform gives `f0_proj` weights ~28× larger (fan-in 1 vs 768), ensuring F0 has equal representational weight at initialisation.
 
 **F0 decoder — argmax, not Viterbi**
 `torchcrepe` is configured with `decoder=torchcrepe.decode.argmax`. Viterbi is a global dynamic-programming algorithm that requires the full sequence and is incompatible with chunk-by-chunk streaming. Argmax is frame-independent and causal.
@@ -705,7 +710,7 @@ The target content vector `[B, T_hub, 769]` has 768 ContentVec channels and 1 lo
 **TNPUnifiedTransformer — no positional encoding, strict conditional independence**
 No positional encoding is used. Speaker identity (timbre, vocal tract shape) is time-invariant, so position should not affect the mapping. Without PE, the model cannot overfit on the temporal position of phonemes in the reference clip.
 
-Context tokens are projected from `(ContentVec+F0, mel)` pairs `[B*N, T_h, 869]` via `ctx_proj = nn.Linear(869, 512)`. Target tokens are projected from `(ContentVec+F0)` `[B, T_hub, 769]` via `tgt_proj = nn.Linear(769, 512)`. After concatenation both pass through 8 shared Transformer layers (d=512, 8 heads, ff=2048). No variational bottleneck — the model is fully deterministic, training and inference behave identically.
+Context tokens are projected from `(ContentVec+F0, mel)` pairs `[B*N, T_h, 869]` via `ctx_proj = nn.Linear(869, 512)`. Target tokens use two separate projections added element-wise: ContentVec `[B, T_hub, 768]` via `hubert_proj = nn.Linear(768, 512)` and log-F0 `[B, T_hub, 1]` via `f0_proj = nn.Linear(1, 512)`. After concatenation both pass through 8 shared Transformer layers (d=512, 8 heads, ff=2048). No variational bottleneck — the model is fully deterministic, training and inference behave identically.
 
 **ContentVec Instance Normalization**
 `F.instance_norm` is applied to ContentVec features `[B, 768, T_frames]` before the F0 concat. It normalises each `(sample, channel)` pair to mean=0 / std=1 across the time dimension, stripping any residual per-sample spectral bias. ContentVec's training objective already reduces speaker leakage; instance norm is a second hard constraint ensuring the content stream cannot bypass it.
@@ -778,7 +783,7 @@ from core.modules.tnp_unified import TNPUnifiedTransformer
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 m = VoiceConversionModel(device)
-print("Trainable params:", m.trainable_param_count())   # 26,111,076
+print("Trainable params:", m.trainable_param_count())   # 26,111,588
 
 # TNP-D mask correctness
 L_ctx, L_tgt = 80, 60

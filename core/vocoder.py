@@ -11,7 +11,7 @@ class VocosVocoder(nn.Module):
     Input:  log-mel [B, 100, T_mel]  24000 Hz / n_fft 1024 / hop 256
     Output: waveform [B, 1, T_wav]   24000 Hz float32 in [-1, 1]
 
-    Log scale: log(mel.clamp(min=1e-5)) — matches vocos training convention.
+    Log scale: log(mel.clamp(min=1e-7)) — matches vocos safe_log default.
     All parameters are frozen.
     """
 

@@ -116,18 +116,18 @@ class ContentEncoder(nn.Module):
         """
         return self.contentvec(audio_16k).last_hidden_state  # [B, T_frames, 768]
 
-    PERIODICITY_THRESHOLD = 0.5  # frames below this confidence are treated as unvoiced
+    PERIODICITY_THRESHOLD = 0.5
+    F0_MEDIAN_KERNEL = 5  # nanmedian window for octave-jump spike removal
 
     @torch.no_grad()
     def _extract_f0(self, audio_16k: Tensor) -> Tensor:
         """
-        Extract fundamental frequency with torchcrepe + periodicity filtering.
+        Extract F0 with torchcrepe + periodicity gate + nanmedian spike filter.
 
-        The argmax decoder always returns a pitch value, even for unvoiced or
-        noisy frames.  Without periodicity filtering this causes octave errors
-        (e.g. 650 Hz instead of the true ~160 Hz) and inflated statistics.
-        Frames with periodicity below PERIODICITY_THRESHOLD are set to 0.0
-        (unvoiced).
+        Unvoiced frames are marked NaN before the median window so they cannot
+        pull voiced pitch values down.  nanmedian returns a non-NaN value as
+        long as at least one frame in the window is voiced, naturally filling
+        short gaps without corrupting genuine silence.
 
         Args:
             audio_16k: [B, T]  16 kHz mono
@@ -135,7 +135,6 @@ class ContentEncoder(nn.Module):
             f0:        [B, T_frames, 1]  F0 in Hz (0.0 for unvoiced)
         """
         if not self._crepe_available:
-            # Fallback: return zeros if torchcrepe not installed
             B = audio_16k.shape[0]
             T_frames = (audio_16k.shape[-1] // self.HOP) + 1
             return torch.zeros(B, T_frames, 1, device=self.device)
@@ -145,18 +144,31 @@ class ContentEncoder(nn.Module):
             sample_rate=self.SR_HUB,
             hop_length=self.HOP,
             fmin=50.0,
-            fmax=1100.0,  # covers speech and singing (soprano ~1100 Hz)
-            model="tiny",  # fast inference
+            fmax=800.0,
+            model="tiny",
             decoder=torchcrepe.decode.argmax,
             return_periodicity=True,
             batch_size=None,
             device=self.device,
             pad=True,
-        )  # pitch: [B, T_frames], periodicity: [B, T_frames]
+        )
         pitch = torch.nan_to_num(pitch, nan=0.0)
-        # Zero out low-confidence frames (unvoiced / noisy)
-        pitch = torch.where(periodicity >= self.PERIODICITY_THRESHOLD, pitch, torch.zeros_like(pitch))
-        return pitch.unsqueeze(-1)  # [B, T_frames, 1]
+
+        # Mark unvoiced frames as NaN — they will not contaminate the median window
+        voiced = periodicity >= self.PERIODICITY_THRESHOLD
+        pitch_nan = torch.where(voiced, pitch, torch.full_like(pitch, float("nan")))
+
+        # nanmedian: each window takes median of non-NaN values only
+        k   = self.F0_MEDIAN_KERNEL
+        pad = k // 2
+        pitch_padded = F.pad(
+            pitch_nan.unsqueeze(1), (pad, pad), mode="constant", value=float("nan")
+        )
+        windows   = pitch_padded.unfold(-1, k, 1)               # [B, 1, T, k]
+        pitch_med = windows.nanmedian(dim=-1).values.squeeze(1)  # [B, T]
+
+        # Frames surrounded entirely by unvoiced stay NaN → 0
+        return torch.nan_to_num(pitch_med, nan=0.0).unsqueeze(-1)  # [B, T_frames, 1]
 
     def forward(
         self,

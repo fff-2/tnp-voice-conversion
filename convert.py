@@ -47,16 +47,23 @@ def load_audio(path: str, device: torch.device) -> torch.Tensor:
 
 
 def extract_f0_stats(audio: torch.Tensor, model) -> tuple | None:
-    """Return (mean_hz, std_hz) of voiced frames from audio [1, T] at 16 kHz, or None."""
+    """
+    Return (center_hz, spread_hz) of voiced F0 using robust estimators.
+
+    Uses median + MAD-based std (×1.4826) instead of mean + std so that
+    residual octave-error frames do not inflate the spread estimate.
+    """
     if not model.content_encoder._crepe_available:
         return None
     with torch.no_grad():
         f0 = model.content_encoder._extract_f0(audio)   # [1, T_frames, 1]
     f0_np = f0[0, :, 0].cpu().numpy()
-    voiced = f0_np > 0.0
-    if voiced.sum() < 2:
+    voiced = f0_np[f0_np > 0.0]
+    if len(voiced) < 2:
         return None
-    return float(f0_np[voiced].mean()), float(max(f0_np[voiced].std(), 5.0))
+    center = float(np.median(voiced))
+    spread = float(max(np.median(np.abs(voiced - center)) * 1.4826, 5.0))
+    return center, spread
 
 
 def convert(args) -> None:

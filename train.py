@@ -46,7 +46,7 @@ VOCODER_SR = 24_000  # mel computation and vocoder output sample rate
 BATCH_SIZE = 32  # physical batch per GPU step — increase to fill VRAM
 GRAD_ACCUM = 2  # effective batch = BATCH_SIZE * GRAD_ACCUM = 64
 MAX_STEPS = 100_000
-SAVE_EVERY = 2500
+SAVE_EVERY = 1000
 LOG_EVERY = 50
 CSV_LOG_EVERY = 50
 WARMUP_STEPS = 1_000
@@ -97,7 +97,7 @@ def train(args) -> None:
     csv_path = output_dir / args.csv_log
     if not csv_path.exists():
         with open(csv_path, "w", newline="") as f:
-            csv.writer(f).writerow(["step", "train_loss", "val_loss", "learning_rate"])
+            csv.writer(f).writerow(["step", "train_total", "train_recon", "train_delta", "val_loss", "learning_rate"])
 
     ckpt_path = output_dir / "latest.pt"
     if ckpt_path.exists() and not args.reset:
@@ -139,6 +139,8 @@ def train(args) -> None:
     # ── Training loop ─────────────────────────────────────────────────────────
     optimizer.zero_grad()
     running_loss = 0.0
+    running_recon = 0.0
+    running_delta = 0.0
     accum_count = 0
 
     while step < MAX_STEPS:
@@ -180,10 +182,31 @@ def train(args) -> None:
                 recon_loss = (loss_raw * mask.unsqueeze(-1)).sum() / (
                     mask.sum() * N_MELS + 1e-8
                 )
-                loss = recon_loss / GRAD_ACCUM
+
+                # Temporal delta loss: frame-to-frame change in mel [B, T-1, N_MELS]
+                pred_dt = pred_mel[:, 1:T, :] - pred_mel[:, :T - 1, :]
+                tgt_dt = tgt_mel[:, 1:T, :] - tgt_mel[:, :T - 1, :]
+                mask_dt = mask[:, 1:].unsqueeze(-1)  # [B, T-1, 1]
+                loss_delta_time = F.l1_loss(
+                    pred_dt * mask_dt, tgt_dt * mask_dt, reduction="sum"
+                ) / (mask_dt.sum() * N_MELS + 1e-8)
+
+                # Spectral delta loss: mel-bin-to-bin change (timbre contour) [B, T, N_MELS-1]
+                pred_df = pred_mel[:, :T, 1:] - pred_mel[:, :T, :-1]
+                tgt_df = tgt_mel[:, :T, 1:] - tgt_mel[:, :T, :-1]
+                mask_df = mask.unsqueeze(-1)  # [B, T, 1] → broadcasts over N_MELS-1
+                loss_delta_freq = F.l1_loss(
+                    pred_df * mask_df, tgt_df * mask_df, reduction="sum"
+                ) / (mask_df.sum() * (N_MELS - 1) + 1e-8)
+
+                delta_loss = 0.5 * (loss_delta_time + loss_delta_freq)
+                total_loss = recon_loss + delta_loss
+                loss = total_loss / GRAD_ACCUM
 
             loss.backward()
-            running_loss += recon_loss.item()
+            running_loss += total_loss.item()
+            running_recon += recon_loss.item()
+            running_delta += delta_loss.item()
             accum_count += 1
 
             # ── Optimizer step every GRAD_ACCUM mini-batches ─────────────────
@@ -201,13 +224,18 @@ def train(args) -> None:
 
                 # ── Logging ───────────────────────────────────────────────────
                 if step % LOG_EVERY == 0:
-                    avg_recon = running_loss / (LOG_EVERY * GRAD_ACCUM)
-                    running_loss = 0.0
-                    logger.info(f"step={step:6d}  recon={avg_recon:.4f}  lr={lr:.2e}")
+                    avg_loss = running_loss / (LOG_EVERY * GRAD_ACCUM)
+                    avg_recon = running_recon / (LOG_EVERY * GRAD_ACCUM)
+                    avg_delta = running_delta / (LOG_EVERY * GRAD_ACCUM)
+                    running_loss = running_recon = running_delta = 0.0
+                    logger.info(
+                        f"step={step:6d}  loss={avg_loss:.4f}"
+                        f"  recon={avg_recon:.4f}  delta={avg_delta:.4f}  lr={lr:.2e}"
+                    )
 
                     if step % CSV_LOG_EVERY == 0:
                         with open(csv_path, "a", newline="") as f:
-                            csv.writer(f).writerow([step, avg_recon, last_val_loss, lr])
+                            csv.writer(f).writerow([step, avg_loss, avg_recon, avg_delta, last_val_loss, lr])
 
                 # ── Checkpointing ─────────────────────────────────────────────
                 if step % SAVE_EVERY == 0:
@@ -333,6 +361,7 @@ def _validate(
                         c = float(np.median(lv))
                         s = float(max(np.median(np.abs(lv - c)) * 1.4826, 0.05))
                         return c, s
+
                     sc, ss = _robust_log(src_v)
                     tc, ts = _robust_log(tgt_v)
                     sample_f0_stats = (sc, ss, tc, ts)
@@ -351,7 +380,9 @@ def _validate(
 
                 with torch.no_grad():
                     denoised_src = model.content_encoder._denoise(source[0:1, :src_len])
-                wav = model.convert_chunk_streaming(denoised_src, C_sample, f0_stats=sample_f0_stats)
+                wav = model.convert_chunk_streaming(
+                    denoised_src, C_sample, f0_stats=sample_f0_stats
+                )
             sf.write(
                 str(sample_dir / "converted.wav"),
                 wav[0, 0, :].cpu().numpy(),

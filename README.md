@@ -2,7 +2,7 @@
 
 Few-shot, real-time voice conversion for both **speech and singing**. Record a few seconds of a target speaker — the system converts your live microphone input into that voice with low latency. The model is trained on a mixture of VCTK speech data and JVS-MuSiC singing data, enabling vocal conversion across speaking and singing registers.
 
-**Architecture:** Deterministic Transformer Neural Process (TNP-D) — context (ContentVec+F0, mel) tokens and target (ContentVec+F0) tokens are concatenated into one sequence and processed by a single shared Transformer with a block attention mask: context tokens see only context, each target token sees all context plus only itself (conditional independence). No stochastic sampling; training optimises a single masked L1 reconstruction loss.
+**Architecture:** Deterministic Transformer Neural Process (TNP-D) — context (ContentVec+F0, mel) tokens and target (ContentVec+F0) tokens are concatenated into one sequence and processed by a single shared Transformer with a block attention mask: context tokens see only context, each target token sees all context plus only itself (conditional independence). No stochastic sampling; training optimises a combined loss of masked L1 reconstruction + temporal and spectral delta regularisation.
 
 ---
 
@@ -197,7 +197,10 @@ audio_content  ──→ ContentEncoder (Crepe F0)  ──→  F0 appended to Co
         │
   take target portion → upsample → mel_proj → pred_mel [B, T_mel, 100]
 
-Loss: Masked L1( pred_mel,  mel(audio_content) )          ← reconstruction only
+Loss: total = recon + 0.5 × (delta_time + delta_freq)
+        recon      = Masked L1( pred_mel, mel(audio_content) )
+        delta_time = Masked L1 on frame-to-frame mel differences   (temporal contour)
+        delta_freq = Masked L1 on mel-bin-to-bin differences        (spectral contour)
 ```
 
 Because prediction and ground truth come from the same speaker, the loss is phonetically valid. The augmented source has different pitch and formant characteristics from the clean context clips — the model cannot copy timbre from content features and must consult `C` to reconstruct the correct spectral shape.
@@ -452,7 +455,15 @@ Computing mel spectrograms on the CPU inside the DataLoader is the primary bottl
 
 ## Training — `train.py`
 
-Trains `TNPUnifiedTransformer` with bfloat16 AMP and gradient accumulation. `ContentEncoder` and `VocosVocoder` remain frozen throughout.
+Trains `TNPUnifiedTransformer` with bfloat16 AMP and gradient accumulation. `ContentEncoder` and `VocosVocoder` remain frozen throughout. The loss combines three masked L1 terms:
+
+```
+total = recon_loss + 0.5 × (loss_delta_time + loss_delta_freq)
+```
+
+- **recon_loss** — L1 between predicted mel and target mel (absolute spectral shape)
+- **loss_delta_time** — L1 on frame-to-frame differences (temporal contour / prosody)
+- **loss_delta_freq** — L1 on mel-bin-to-bin differences (spectral contour / timbre)
 
 ```bash
 python train.py --reset                       # train from scratch (required: new architecture)
@@ -473,7 +484,9 @@ Every 50 steps (`CSV_LOG_EVERY`), a row is appended to `checkpoints/training_log
 | Column | Description |
 |---|---|
 | `step` | Optimizer step number |
-| `train_loss` | Average masked L1 reconstruction loss over the last 50 steps |
+| `train_total` | Average combined loss over the last 50 steps (`recon + 0.5×(delta_time + delta_freq)`) |
+| `train_recon` | Average masked L1 reconstruction component |
+| `train_delta` | Average combined delta component (`0.5×(delta_time + delta_freq)`) |
 | `val_loss` | Most recent validation loss (carries forward between checkpoints) |
 | `learning_rate` | Current LR after warmup / cosine schedule |
 
@@ -488,7 +501,7 @@ Quick inspection:
 ```python
 import pandas as pd
 df = pd.read_csv("checkpoints/training_log.csv")
-df.plot(x="step", y=["train_loss", "val_loss"])
+df.plot(x="step", y=["train_total", "train_recon", "train_delta", "val_loss"])
 ```
 
 ### Qualitative audio samples
@@ -524,7 +537,7 @@ MAX_AUDIO_SEC = 8.0      # clip length — increase to use more VRAM
 MAX_STEPS     = 100_000
 LR            = 1e-4
 WARMUP_STEPS  = 1_000
-SAVE_EVERY    = 2_500    # validation + checkpoint + audio sample interval
+SAVE_EVERY    = 1_000    # validation + checkpoint + audio sample interval
 ```
 
 </details>
@@ -722,8 +735,25 @@ Context tokens are projected from `(ContentVec+F0, mel)` pairs `[B*N, T_h, 869]`
 **ContentVec Instance Normalization**
 `F.instance_norm` is applied to ContentVec features `[B, 768, T_frames]` before the F0 concat. It normalises each `(sample, channel)` pair to mean=0 / std=1 across the time dimension, stripping any residual per-sample spectral bias. ContentVec's training objective already reduces speaker leakage; instance norm is a second hard constraint ensuring the content stream cannot bypass it.
 
-**Masked L1 loss**
-The training loss is computed only over valid (non-padded) mel frames. `collate_fn` returns `content_lengths` (original audio sample counts for the content clip); the training loop converts these to mel frame counts and builds a boolean mask before calling `F.l1_loss(..., reduction="none")`. Padding regions contain `log(1e-7) ≈ −16.1` and would otherwise waste model capacity if included in the loss.
+**Combined delta loss**
+The training loss has three masked L1 components, all computed only over valid (non-padded) frames:
+
+```python
+# recon: absolute spectral shape
+recon_loss = F.l1_loss(pred_mel * mask, tgt_mel * mask, reduction="sum") / (mask.sum() * N_MELS)
+
+# delta_time: frame-to-frame change (temporal contour / prosody)
+pred_dt = pred_mel[:, 1:T, :] - pred_mel[:, :T-1, :]
+loss_delta_time = F.l1_loss(pred_dt * mask_dt, tgt_dt * mask_dt, reduction="sum") / (mask_dt.sum() * N_MELS)
+
+# delta_freq: mel-bin-to-bin change (spectral contour / timbre)
+pred_df = pred_mel[:, :T, 1:] - pred_mel[:, :T, :-1]
+loss_delta_freq = F.l1_loss(pred_df * mask_df, tgt_df * mask_df, reduction="sum") / (mask_df.sum() * (N_MELS-1))
+
+total_loss = recon_loss + 0.5 * (loss_delta_time + loss_delta_freq)
+```
+
+`collate_fn` returns `content_lengths` (original audio sample counts); the training loop converts these to mel frame counts and builds a boolean mask. Padding regions contain `log(1e-7) ≈ −16.1` and are excluded from all three terms. The mask is applied to both predictions and targets before `reduction="sum"` (cleaner than post-hoc multiplication) and each term is normalised by its own valid-pair count.
 
 **Batch padding and lengths**
 `collate_fn` zero-pads `source_audio` and `audio_content` to the batch maximum length. `source_lengths` and `content_lengths` are returned alongside the padded tensors so callers can recover the unpadded region. When saving validation audio samples, `source[0, :source_lengths[0]]` and `content_audio[0, :content_lengths[0]]` are used — feeding the full padded tensor (including zero-padding) into ContentVec causes garbage features for the silent tail, producing silence in the converted output after the real audio ends.

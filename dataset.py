@@ -96,7 +96,7 @@ class SpeakerDataset(Dataset):
 
         # Build index: each entry is (spk, utt_idx).
         # source = augmented version of utt_idx; audio_content = clean version.
-        N_ITEMS = 350  # items per speaker (cap); speakers with fewer files use all without duplication
+        N_ITEMS = 200  # items per speaker (cap); speakers with fewer files use all without duplication
         self.pairs: list[tuple[str, int]] = []
         rng2 = random.Random(seed + 1)
         for spk in self.spk_names:
@@ -199,7 +199,7 @@ class SpeakerDataset(Dataset):
         ctx_audios_list = []
         ctx_audio_lens = []
         for i in ctx_indices:
-            ctx_audio = self._load(spk_files[i])          # [T] @ 16kHz
+            ctx_audio = self._load(spk_files[i])  # [T] @ 16kHz
             ctx_audio_lens.append(ctx_audio.shape[0])
             ctx_audios_list.append(ctx_audio)
 
@@ -228,7 +228,7 @@ class SpeakerDataset(Dataset):
             "source_audio": source_audio,
             "audio_content": audio_content,
             "context_mels": context_mels,
-            "ctx_mel_lens": mel_lens,      # list[N_CTX] unpadded mel-frame counts (for visualization)
+            "ctx_mel_lens": mel_lens,  # list[N_CTX] unpadded mel-frame counts (for visualization)
             "context_audios": context_audios,  # [N_CTX, T_max_audio] @ 16kHz
             "ctx_audio_lens": ctx_audio_lens,  # list[N_CTX] unpadded sample counts
         }
@@ -255,9 +255,11 @@ def collate_fn(batch: list[dict]) -> dict:
         "source_audio": pad1d([b["source_audio"] for b in batch]),
         "audio_content": pad1d([b["audio_content"] for b in batch]),
         "context_mels": pad_mels([b["context_mels"] for b in batch]),
-        "context_audios": pad_ctx_audios([b["context_audios"] for b in batch]),  # [B, N_CTX, T]
+        "context_audios": pad_ctx_audios(
+            [b["context_audios"] for b in batch]
+        ),  # [B, N_CTX, T]
         "source_lengths": [b["source_audio"].shape[0] for b in batch],
         "content_lengths": [b["audio_content"].shape[0] for b in batch],
-        "ctx_mel_lens": [b["ctx_mel_lens"] for b in batch],     # for visualization
-        "ctx_audio_lens": [b["ctx_audio_lens"] for b in batch], # for mask construction
+        "ctx_mel_lens": [b["ctx_mel_lens"] for b in batch],  # for visualization
+        "ctx_audio_lens": [b["ctx_audio_lens"] for b in batch],  # for mask construction
     }
